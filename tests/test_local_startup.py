@@ -17,7 +17,7 @@ class LocalStartupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             data = Path(temp)
             env = {**os.environ, 'NOVEL_OPEN_BROWSER': '0', 'NOVEL_DATA_DIR': str(data),
-                   'NOVEL_DB_PATH': str(data / 'novel.db')}
+                   'NOVEL_DB_PATH': str(data / 'novel.db'), 'PYTHONIOENCODING': 'cp1252'}
             with (data / 'service.log').open('w', encoding='utf-8') as log:
                 proc = subprocess.Popen([sys.executable, '-u', str(root / 'app.py')],
                                         cwd=str(root), env=env, stdout=log, stderr=log)

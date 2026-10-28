@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,3 +20,14 @@ def source_version() -> str:
 
 # 不能在 health 请求时重新计算，否则旧进程也会自称运行了磁盘上的新代码。
 CODE_VERSION = source_version()
+
+
+def configure_stdio() -> None:
+    """Windows 重定向到日志时可能仍用 cp1252，不能让中文提示阻止服务启动。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass

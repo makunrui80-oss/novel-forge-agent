@@ -132,6 +132,7 @@ def start_service(py: Path, preferred: int) -> tuple[subprocess.Popen | None, in
 
 
 def main() -> int:
+    runtime.configure_stdio()
     os.chdir(ROOT)
     try:
         py = prepare_env()

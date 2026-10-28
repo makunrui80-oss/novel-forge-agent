@@ -464,6 +464,8 @@ async def update_generated(gid: int, payload: dict = Body(...)):
     title = payload.get("title", row["title"])
     content = payload.get("content", row["content"])
     polished = payload.get("polished", row["polished"])
+    if content != row["content"] and "polished" not in payload:
+        polished = ""  # 旧优化稿基于旧正文，不能继续用于前文记忆或导出。
     changed = content != row["content"] or polished != row["polished"]
     if changed:
         pipeline._backup_chapter(row["project_id"], row["idx"], row, 0, "manual_edit")
@@ -710,6 +712,7 @@ def _open_when_ready(host: str, port: int, url: str) -> None:
 def main() -> None:
     import uvicorn
 
+    runtime.configure_stdio()
     cfg = config.load()
     host = cfg["server"].get("host", "127.0.0.1")
     preferred = int(cfg["server"].get("port", 8765))

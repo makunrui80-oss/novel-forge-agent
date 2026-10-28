@@ -225,11 +225,12 @@ class WritingSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipeline._gen_row(self.pid, 2)['content'], self.new)
 
     async def test_manual_edit_clears_score_and_stale_contexts_and_keeps_backup(self):
-        row = self.chapter(1)
+        row = self.chapter(1, polished='基于旧正文的优化稿')
         db.execute('INSERT INTO contexts(project_id,after_batch,content) VALUES(?,?,?)', (self.pid, 0, '{}'))
         await web.update_generated(row['id'], {'content': self.new})
         current = pipeline._gen_row(self.pid, 1)
         self.assertIsNone(current['zhuque_score'])
+        self.assertEqual(current['polished'], '')
         self.assertIsNone(db.q1('SELECT * FROM contexts WHERE project_id=?', (self.pid,)))
         self.assertEqual(json.loads(db.get_asset(self.pid, 'chapter_1_manual_edit_0_before'))['content'], self.old)
 
