@@ -443,8 +443,7 @@ async def generated_one(gid: int):
     row = db.q1("SELECT * FROM generated WHERE id=?", (gid,))
     if not row:
         raise HTTPException(404, "章节不存在")
-    for name, key in (("detection", f"zhuque_{row['idx']}_latest"),
-                      ("plot_review", f"chapter_review_{row['idx']}")):
+    for name, key in (("detection", f"zhuque_{row['idx']}_latest"),):
         try:
             row[name] = json.loads(db.get_asset(row["project_id"], key) or "null")
         except (ValueError, TypeError):

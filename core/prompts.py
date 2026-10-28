@@ -513,31 +513,6 @@ def polish_batch(book: str, constitution_text: str, text: str, start: int, end: 
     return SYSTEM_WRITER, user
 
 
-def chapter_review(memory: str, text: str, original: str = "", *, realign: bool = False) -> tuple[str, str]:
-    user = f"""审查本章候选正文是否能作为下一章的事实依据。不要重写正文。
-
-【大纲、计划与正文事实边界】
-{memory}
-
-【改写前旧稿（仅编辑任务有；校准任务可修正已确认偏离）】
-{original or '（这是新写章节）'}
-本次是否主题校准：{'是' if realign else '否'}
-
-【候选正文】
-{text}
-
-只检查有明确证据的问题：本章核心事件是否实际完成、与前序正文事实是否直接矛盾、是否提前写完明确指定的后续事件、编辑是否删改原有关键事实或破坏相邻章承接。
-普通编辑有旧稿时，只报本次新引入或加剧的事实问题，不把原稿已经存在的问题当作本次改坏；旧稿的主题偏离应另走主题校准。主题校准则必须纠正已有的核心偏离。
-区分计划（未发生）与正文（已发生）；计划的措辞不要求逐字出现。不要按关键词匹配，不要求用原句写钩子。
-人物弱点不是每场必须失误；每卷一次不是每章一次；条件未触发不强加动作。自然的过渡、文风偏好、背景略写不算剧情偏离。
-不要把创作空间当成冲突：首次见面仍可能通过传话、公开信息了解对方；原计划可因当前阻碍合理细化；宪法要求表现的动作不是“提前揭示”。没有明确限制时，不凭经验新增“此处不能解释动机/主角不能提出方案”等规则。
-只有影响主线/核心事件/因果或已有事实的实质问题才放进 issues，最多三条，拿不准的不报。每项包含 type、issue、evidence（候选正文中的一段连续逐字短引文，不拼接多处句子、不加引号）、basis（大纲、宪法、前文或旧稿中的一段连续逐字引文，不加自己的解释）、suggestion（本章最小修复）。
-若核心事件完全未写，可引用正文中实际替代它的场景作为 evidence。不凭空猜测，不编造引文。无实质问题返回空数组。
-只输出 JSON：{{"issues":[{{"type":"事件缺失/事实冲突/提前透支/改写丢失","issue":"具体问题","evidence":"原文短引文","basis":"对照依据","suggestion":"本章最小修复"}}]}}
-"""
-    return SYSTEM_EDITOR, user
-
-
 def consistency_check(constitution_text: str, outline: str, chapter_text: str) -> tuple[str, str]:
     user = f"""对照创作宪法和大纲，检查这一批正文有没有跑偏。
 

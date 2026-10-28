@@ -1661,7 +1661,6 @@ async function openReader(gid) {
     const detectionNote = detection ? (detection.matches_current
       ? `已核对本次送检正文：${num(detection.text_chars)} 字；${esc(detection.checked_at || '')}。${detection.metric === 'ratio_confidence' ? '分数表示被判为 AI / 疑似 AI 的内容占比，不代表作者身份概率。' : ''}`
       : '正文已修改，上次检测对应旧版本，请重新检测。') : '历史检测未保留送检记录；重新检测后可核对正文版本。';
-    const review = g.plot_review;
     showModal(`
       <div class="modal-head">
         <div>
@@ -1703,8 +1702,7 @@ async function openReader(gid) {
         <div class="card" style="padding:14px">
           <div class="tiny muted" style="margin-bottom:6px">按指令重写这一章</div>
           <textarea class="editor short" id="rewriteInstruction" style="min-height:58px" placeholder="例：压缩重复解释，保留关键对白和本章事件，加强动作因果"></textarea>
-          <div class="tiny muted">重写会读取大纲和前五章，检查剧情后再替换；改变核心事件请使用主题校准。</div>
-          ${review && review.status !== 'passed' ? `<div class="notice warn">第 ${g.idx} 章候选稿${review.status === 'rejected' ? '有剧情问题' : '尚未通过检查'}，原稿已保留。${esc((review.issues || []).map(i => i.issue).join('；') || review.error || '')}</div>` : ''}
+          <div class="tiny muted">重写前读取大纲、本章计划和前五章正文，完成后直接保存，再按设置检测。</div>
           <button class="btn sm" data-act="rewrite-chapter" data-idx="${g.idx}" style="margin-top:8px">提交重写</button>
         </div>
       </div>

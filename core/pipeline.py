@@ -945,7 +945,7 @@ async def _zhuque_loop(task_id: int, pid: int, idx: int, words: int) -> None:
         best_score = score
         if passed or round_no >= max_rounds:
             return
-        tick(task_id, message=f"第 {idx} 章疑似 AI 占比 {score}，正在编辑候选稿；剧情与检测均通过后再替换")
+        tick(task_id, message=f"第 {idx} 章疑似 AI 占比 {score}，正在编辑候选稿，检测改善后再替换")
         try:
             memory = _chapter_memory(pid, idx, _get_constitution(pid)["content"], editing=True)
         except ValueError as exc:
@@ -957,8 +957,8 @@ async def _zhuque_loop(task_id: int, pid: int, idx: int, words: int) -> None:
         new_text = await llm.chat("polish", system, user, project_id=pid,
                                   max_tokens=min(8000, max(3000, int(words * 2.2))), temperature=0.85)
         try:
-            pending_text = await _review_candidate(task_id, pid, idx, new_text, memory, original)
-        except ChapterReviewError:
+            pending_text = await _prepare_candidate(task_id, pid, idx, new_text, original)
+        except ChapterOutputError:
             return
         _ensure_unchanged(pid, idx, row)
 
@@ -1109,8 +1109,8 @@ def _chapter_memory(pid: int, idx: int, constitution_text: str,
     )
 
 
-class ChapterReviewError(ValueError):
-    """候选稿未通过检查，正式正文未被覆盖。"""
+class ChapterOutputError(ValueError):
+    """模型输出为空、明显截断或串章；不作剧情判断。"""
 
 
 def _candidate_body(text: str, idx: int, original: str = "") -> str:
@@ -1118,51 +1118,26 @@ def _candidate_body(text: str, idx: int, original: str = "") -> str:
     text = re.sub(r"\n```\s*$", "", text)
     headings = list(utils.CHAPTER_HEAD_RE.finditer(text))
     if headings and (len(headings) != 1 or utils.cn_to_int(headings[0].group(1)) != idx):
-        raise ChapterReviewError(f"第 {idx} 章返回了其他章号或多章内容")
+        raise ChapterOutputError(f"第 {idx} 章返回了其他章号或多章内容")
     parsed = utils.parse_generated(text)
     body = parsed[0]["content"] if parsed else ("" if headings else text)
     minimum = max(300, int(utils.word_count(original) * 0.65))
     if utils.word_count(body) < minimum:
-        raise ChapterReviewError(f"第 {idx} 章候选正文过短（{utils.word_count(body)} 字，至少 {minimum} 字），可能截断或删失剧情")
+        raise ChapterOutputError(f"第 {idx} 章候选正文过短（{utils.word_count(body)} 字，至少 {minimum} 字），可能截断或删失剧情")
     return body
 
 
-async def _review_candidate(task_id: int, pid: int, idx: int, text: str,
-                            memory: str, original: str = "", *, realign: bool = False) -> str:
-    """语义检查核心事件与事实，不用关键词、文风比例或分数代替剧情判断。"""
-    key = f"chapter_review_{idx}"
-    db.upsert_asset(pid, f"{key}_candidate", text)
+async def _prepare_candidate(task_id: int, pid: int, idx: int, text: str,
+                             original: str = "") -> str:
+    """只解析正文与章号，不再调用模型审查或阻拦剧情。"""
+    db.upsert_asset(pid, f"chapter_output_{idx}_candidate", text)
+    tick(task_id)
     try:
-        body = _candidate_body(text, idx, original)
-        tick(task_id, message=f"正在核对第 {idx} 章核心事件、前文承接与剧情边界")
-        system, user = prompts.chapter_review(memory, body, original, realign=realign)
-
-        def valid(data):
-            issues = data.get("issues")
-            return isinstance(issues, list) and all(
-                isinstance(item, dict) and all(isinstance(item.get(k), str) and item[k].strip()
-                    for k in ("issue", "evidence", "basis", "suggestion"))
-                and item["evidence"].strip() in body
-                and item["basis"].strip() in (memory + "\n" + original) for item in issues)
-
-        data, _ = await call_json("check", system, user, pid=pid, max_tokens=1800,
-                                  temperature=0.2, tag=key, validator=valid, max_attempts=2)
-        issues = data["issues"]
-        db.upsert_asset(pid, key, json.dumps({"chapter": idx, "status": "rejected" if issues else "passed",
-                                              "issues": issues, "checked_at": db.now()}, ensure_ascii=False))
-        if issues:
-            reason = "；".join(f"{d['issue']}（依据：{d['basis']}；建议：{d['suggestion']}）" for d in issues)
-            raise ChapterReviewError(f"第 {idx} 章剧情检查未通过：{reason}")
-        return body
-    except Paused:
-        raise
-    except Exception as exc:
-        if not isinstance(exc, ChapterReviewError) or "剧情检查未通过" not in str(exc):
-            db.upsert_asset(pid, key, json.dumps({"chapter": idx, "status": "unverified", "error": str(exc),
-                                                 "checked_at": db.now()}, ensure_ascii=False))
-        message = f"{exc}；候选稿已暂存，原有正文未覆盖。"
+        return _candidate_body(text, idx, original)
+    except ChapterOutputError as exc:
+        message = f"{exc}；原有正文未覆盖。"
         add_warning(pid, message)
-        raise ChapterReviewError(message) from exc
+        raise ChapterOutputError(message) from exc
 
 
 def _backup_chapter(pid: int, idx: int, row: dict, task_id: int, kind: str) -> None:
@@ -1210,23 +1185,10 @@ async def write_one_chapter(task_id: int, pid: int, plan_row: dict, group: list[
         outline=outline, opening_anchor=opening_anchor, continuity_anchor=continuity_anchor,
     )
     tick(task_id, message=f"已读取大纲和前序剧情，正在写第 {idx} 章《{plan_row.get('title', '')}》")
-    memory = _chapter_memory(pid, idx, constitution_text, plan_row, editing=bool(before))
     text = await llm.chat("write", system, user, project_id=pid,
                           max_tokens=min(8000, max(3000, int(words * 2.2))),
                           temperature=0.82)
-    try:
-        body = await _review_candidate(task_id, pid, idx, text, memory)
-    except ChapterReviewError:
-        report = json.loads(db.get_asset(pid, f"chapter_review_{idx}") or "{}")
-        if report.get("status") != "rejected":
-            raise
-        tick(task_id, message=f"第 {idx} 章发现承接或事件缺项，正在自动修复一次")
-        repair = user + ("\n\n【待修复候选稿】\n" + text + "\n\n【本章审查问题】\n"
-                         + json.dumps(report["issues"], ensure_ascii=False)
-                         + "\n只修复上述有依据的问题，保留有效剧情，不改动前后章事实，输出完整本章正文。")
-        text = await llm.chat("write", system, repair, project_id=pid,
-                              max_tokens=min(8000, max(3000, int(words * 2.2))), temperature=0.6)
-        body = await _review_candidate(task_id, pid, idx, text, memory)
+    body = await _prepare_candidate(task_id, pid, idx, text)
     title = _clean_title(plan_row.get("title", ""))
     _ensure_unchanged(pid, idx, before)
     if before:
@@ -1351,7 +1313,7 @@ async def run_rewrite(task_id: int, pid: int, payload: dict) -> None:
     words = int(config.load()["writing"].get("words_per_chapter") or 2600)
     text = await llm.chat("polish", system, user, project_id=pid,
                           max_tokens=min(8000, max(3000, int(words * 2.2))), temperature=0.75)
-    body = await _review_candidate(task_id, pid, idx, text, memory, _chapter_text(row))
+    body = await _prepare_candidate(task_id, pid, idx, text, _chapter_text(row))
     _ensure_unchanged(pid, idx, row)
     _backup_chapter(pid, idx, row, task_id, "rewrite")
     _invalidate_contexts(pid, idx)
@@ -1441,21 +1403,20 @@ async def realign_batch(task_id: int, pid: int, batch: int) -> None:
         tick(task_id, progress=n - 1, total=total, message=f"正在按主题校准第 {idx} 章（{n}/{total}）")
         text = await llm.chat("polish", system, user, project_id=pid,
                               max_tokens=min(10000, max(4000, int(words * 2.5))), temperature=0.78)
-        memory = _chapter_memory(pid, idx, cons["content"], plan_row, editing=True)
-        body = await _review_candidate(task_id, pid, idx, text, memory, _chapter_text(row), realign=True)
+        body = await _prepare_candidate(task_id, pid, idx, text, _chapter_text(row))
         _ensure_unchanged(pid, idx, row)
         _backup_chapter(pid, idx, row, task_id, "realign")
         _invalidate_contexts(pid, idx)
-        # 顺序落库：校准下一章时读取上一章刚通过检查的版本。
+        # 顺序落库：校准下一章时读取上一章刚保存的版本。
         db.execute("UPDATE generated SET content=?, polished='', status='draft', zhuque_score=NULL, updated_at=? WHERE project_id=? AND idx=?",
                    (body, db.now(), pid, idx))
         await _zhuque_loop(task_id, pid, idx, words)
         staged.append(idx)
     if not staged:
         raise ValueError("没有得到可用的校准正文，原稿均已保留。")
-    tick(task_id, message=f"{len(staged)} 章校准稿已通过检查，正在更新承接卡")
+    tick(task_id, message=f"{len(staged)} 章校准稿已保存，正在更新承接卡")
     await _build_context(task_id, pid, batch, group, cons["content"])
-    tick(task_id, progress=len(staged), total=total, message=f"已校准 {len(staged)} 章并通过剧情检查，承接卡已更新")
+    tick(task_id, progress=len(staged), total=total, message=f"已校准 {len(staged)} 章，承接卡已更新")
 
 
 async def run_polish(task_id: int, pid: int, payload: dict) -> None:
@@ -1482,8 +1443,8 @@ async def run_polish(task_id: int, pid: int, payload: dict) -> None:
                               max_tokens=min(8000, max(3000, int(words * 2.2))),
                               temperature=0.85)
         try:
-            body = await _review_candidate(task_id, pid, idx, text, memory, _chapter_text(row))
-        except ChapterReviewError:
+            body = await _prepare_candidate(task_id, pid, idx, text, _chapter_text(row))
+        except ChapterOutputError:
             continue
         _ensure_unchanged(pid, idx, row)
         _backup_chapter(pid, idx, row, task_id, "polish")
@@ -1499,7 +1460,7 @@ async def run_polish(task_id: int, pid: int, payload: dict) -> None:
             await _build_context(task_id, pid, b, group, cons["content"])
     if len(changed) == len(idxs):
         db.execute("UPDATE projects SET status='polished', updated_at=? WHERE id=?", (db.now(), pid))
-    tick(task_id, progress=len(idxs), total=len(idxs), message=f"优化完成：{len(changed)} 章通过；{len(idxs) - len(changed)} 章保留原稿，具体原因见警告")
+    tick(task_id, progress=len(idxs), total=len(idxs), message=f"优化完成：{len(changed)} 章已更新；{len(idxs) - len(changed)} 章保留原稿，具体原因见警告")
 
 
 async def refresh_context(task_id: int, pid: int, payload: dict) -> None:
