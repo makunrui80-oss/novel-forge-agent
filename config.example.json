@@ -1,0 +1,8 @@
+{
+  "providers": [{"id": "my-provider", "name": "我的 OpenAI 兼容供应商", "type": "openai", "base_url": "https://api.example.com/v1", "api_key": "", "models": ["your-model-name"], "extra_headers": {}}],
+  "stage_models": {"analyze": "my-provider::your-model-name", "outline": "my-provider::your-model-name", "write": "my-provider::your-model-name", "check": "my-provider::your-model-name", "polish": "my-provider::your-model-name"},
+  "zhuque": {"enabled": false, "mode": "manual", "adapter": "makers", "api_key": "", "endpoint": "", "timeout": 60},
+  "writing": {"batch_size": 5, "words_per_chapter": 2600, "context_tail_chars": 1800},
+  "analysis": {"detail_parallelism": 1, "archive_interval": 2},
+  "server": {"host": "127.0.0.1", "port": 8765, "open_browser": true}
+}

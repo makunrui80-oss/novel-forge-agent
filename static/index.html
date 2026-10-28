@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小说智能体 · NOVEL FORGE</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">
+          <path d="M6 25V7l7 9 3-4 4 5 6-8v16" fill="none" stroke="url(#g)" stroke-width="2.2" stroke-linejoin="round"/>
+          <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#8b7bff"/><stop offset="1" stop-color="#3ddbe8"/>
+          </linearGradient></defs>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">NOVEL FORGE</div>
+        <div class="brand-sub">小说智能体</div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <button data-view="dashboard"><span class="num">01</span>总览</button>
+      <button data-view="analyze"><span class="num">02</span>拆书</button>
+      <button data-view="outline"><span class="num">03</span>原创大纲</button>
+      <button data-view="constitution"><span class="num">04</span>创作宪法</button>
+      <button data-view="write"><span class="num">05</span>写作</button>
+      <button data-view="polish"><span class="num">06</span>优化导出</button>
+      <button data-view="tasks"><span class="num">07</span>任务中心</button>
+      <button data-view="settings"><span class="num">08</span>设置</button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="side-label">余额预警</div>
+      <div class="side-balance"><span id="sideBalance">--</span><span id="sideBalanceNote" class="muted"></span></div>
+      <div class="side-hint">阈值 <span id="thresholdLabel">3</span> 元，低于阈值会提醒</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="proj">
+        <label>项目</label>
+        <select id="projectSelect"><option value="">未选择</option></select>
+        <button class="btn ghost sm" id="newProjectBtn">新建</button>
+      </div>
+      <div class="top-actions">
+        <div class="task-chip" id="taskChip" hidden></div>
+        <button class="btn primary sm" id="continueBtn">继续任务</button>
+      </div>
+    </header>
+
+    <div class="content">
+      <section class="view" id="view-dashboard"></section>
+      <section class="view" id="view-analyze"></section>
+      <section class="view" id="view-outline"></section>
+      <section class="view" id="view-constitution"></section>
+      <section class="view" id="view-write"></section>
+      <section class="view" id="view-polish"></section>
+      <section class="view" id="view-tasks"></section>
+      <section class="view" id="view-settings"></section>
+    </div>
+  </main>
+</div>
+
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+</div>
+<div class="toasts" id="toasts"></div>
+
+<script src="/static/app.js?v=20261028-service-repair-2"></script>
+</body>
+</html>
