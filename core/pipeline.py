@@ -1,4 +1,4 @@
-"""核心流水线：拆书 → 六维分析 → 原创大纲 → 创作宪法 → 5 章一批写作 → 承接 → 优化。
+"""核心流水线：拆书 → 六维分析 → 原创大纲 → 创作宪法 → 逐章写作 → 承接 → 优化。
 
 每个批次都是一个可断点续跑的任务，所有中间结果落库。
 """
@@ -891,76 +891,264 @@ def _chapter_text(row: dict, polished: bool = True) -> str:
     return row.get("content") or ""
 
 
-async def _zhuque_loop(task_id: int, pid: int, idx: int, words: int) -> None:
+def _chapter_passed(row: dict | None, cfg: dict | None = None) -> bool:
+    """已完成检测且分数不高于 60，才可继续写下一章。"""
+    if not row or row.get("status") not in {"checked", "medium_aigc", "high_aigc"}:
+        return False
+    try:
+        score = float(row.get("zhuque_score"))
+    except (TypeError, ValueError):
+        return False
+    return score <= 60
+
+
+def _zhuque_status(score: float) -> str:
+    """人工率高于 50% 标绿；疑似 AI 不超过 60% 可继续；高于 60% 限制写作。"""
+    if score < 50:
+        return "checked"
+    if score <= 60:
+        return "medium_aigc"
+    return "high_aigc"
+
+
+def _flagged_ranges(segments: list | None, text_len: int) -> list[tuple[int, int]]:
+    """把相邻的 label=2 分段合并成可改写的字符区间。"""
+    ranges: list[list[int]] = []
+    for item in segments or []:
+        if not isinstance(item, dict) or int(item.get("label", 0)) != 2:
+            continue
+        position = item.get("position") or []
+        if not isinstance(position, (list, tuple)) or len(position) < 2:
+            continue
+        try:
+            start, length = int(position[0]), int(position[1])
+        except (TypeError, ValueError):
+            continue
+        start = max(0, start)
+        end = min(text_len, start + max(0, length))
+        if start >= end:
+            continue
+        if ranges and start <= ranges[-1][1] + 80:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    return [(a, b) for a, b in ranges if b - a >= 40]
+
+
+def _clean_repair_text(text: str, max_len: int) -> str:
+    """只保留模型返回的段落正文，拒绝整章标题、解释和超长输出。"""
+    value = (text or "").strip()
+    value = re.sub(r"^```(?:markdown|text)?\s*", "", value)
+    value = re.sub(r"\s*```$", "", value)
+    value = re.sub(r"^(?:改写后|修改后|新段落|替换段)[：:]\s*", "", value.strip())
+    value = value.strip()
+    if not value or len(value) > max_len:
+        return ""
+    if utils.CHAPTER_HEAD_RE.search(value):
+        return ""
+    return value
+
+
+async def _repair_flagged_segments(task_id: int, pid: int, idx: int, text: str,
+                                   score: float, res: dict, target: float,
+                                   rounds: int) -> tuple[str, float, dict, bool]:
+    """按朱雀分段定位高风险段，只压缩这些段，保留其余正文和剧情事实。"""
+    best_text, best_score, best_res = text, float(score), res
+    repaired = False
+    try:
+        constitution_text = _get_constitution(pid)["content"]
+    except ValueError as exc:
+        add_warning(pid, f"第 {idx} 章自动压缩跳过：{exc}")
+        return best_text, best_score, best_res, repaired
+    book = new_book_title(pid)
+    tried: set[tuple[int, int]] = set()
+    for round_no in range(max(0, int(rounds))):
+        if best_score < target:
+            break
+        segments = (best_res.get("diagnostics") or {}).get("segments") or []
+        ranges = [item for item in _flagged_ranges(segments, len(best_text)) if item not in tried]
+        if not ranges:
+            break
+        start, end = max(ranges, key=lambda item: item[1] - item[0])
+        original_len = end - start
+        if original_len < 60:
+            break
+        segment = best_text[start:end]
+        before_ctx = best_text[max(0, start - 260):start]
+        after_ctx = best_text[end:end + 260]
+        tick(task_id, message=f"第 {idx} 章朱雀 {best_score}，正在压缩第 {round_no + 1} 处高风险段落")
+        system, user = prompts.repair_segment(book, constitution_text, segment, before_ctx, after_ctx)
+        try:
+            raw = await llm.chat("polish", system, user, project_id=pid,
+                                 max_tokens=min(6000, max(1200, int(original_len * 1.2))),
+                                 temperature=0.75, timeout=180)
+        except Paused:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            add_warning(pid, f"第 {idx} 章高风险段改写失败：{exc}")
+            break
+        replacement = _clean_repair_text(raw, int(original_len * 1.05))
+        if len(replacement) < max(60, int(original_len * 0.25)):
+            add_warning(pid, f"第 {idx} 章高风险段改写过短或格式不对，换下一段重试。")
+            tried.add((start, end))
+            continue
+        candidate = best_text[:start] + replacement + best_text[end:]
+        try:
+            res2 = await zhuque.detect(candidate)
+        except Exception as exc:  # noqa: BLE001
+            add_warning(pid, f"第 {idx} 章高风险段改写后检测失败：{exc}")
+            break
+        score2 = res2.get("score")
+        if not res2.get("ok") or score2 is None:
+            add_warning(pid, f"第 {idx} 章高风险段改写后检测未成功：{res2.get('error', '')}")
+            break
+        if float(score2) >= best_score:
+            add_warning(pid, f"第 {idx} 章高风险段改写未降分（{best_score} → {score2}），换下一段重试。")
+            tried.add((start, end))
+            continue
+        best_text, best_score, best_res = candidate, float(score2), res2
+        repaired = True
+        db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_repair_{round_no}",
+                        json.dumps({"round": round_no + 1, "score": score2,
+                                    "ratio": (res2.get("diagnostics") or {}).get("ratio_confidence"),
+                                    "start": start, "end": end,
+                                    "replaced_chars": len(replacement),
+                                    "segments": (res2.get("diagnostics") or {}).get("segments")},
+                                   ensure_ascii=False))
+    return best_text, best_score, best_res, repaired
+
+
+async def _auto_zhuque_check(task_id: int, pid: int, idx: int) -> None:
+    """正文生成后只调用一次朱雀；余额不足时转到网页免费额度。"""
     cfg = config.load().get("zhuque", {})
-    if not cfg.get("enabled"):
-        return
-    if cfg.get("mode") == "manual":
-        db.execute("UPDATE generated SET status='await_check', updated_at=? WHERE project_id=? AND idx=?",
-                   (db.now(), pid, idx))
-        return
-    threshold = float(cfg.get("pass_threshold", 20))
-    max_rounds = max(0, int(cfg.get("max_rounds", 2)))
-    best_score = None
-    pending_text = None
-    for round_no in range(max_rounds + 1):
+    if not cfg.get("enabled") or cfg.get("mode") == "manual" or cfg.get("auto_detect", True) is False:
         row = _gen_row(pid, idx)
         if not row:
             return
-        current_text = pending_text if pending_text is not None else _chapter_text(row)
-        tick(task_id, message=f"第 {idx} 章朱雀检测（第 {round_no + 1} 次）")
-        res = await zhuque.detect(current_text)
-        _ensure_unchanged(pid, idx, row)
-        score = res.get("score")
-        promote = bool(res.get("ok")) and (best_score is None or score < best_score)
-        diagnostic = {"chapter": idx, "round": round_no + 1, "checked_at": db.now(),
-                      "text_sha256": hashlib.sha256(current_text.encode("utf-8")).hexdigest(),
-                      "text_chars": len(current_text), "applied": promote,
-                      "source": "candidate" if pending_text is not None else (
-                          "polished" if (row.get("polished") or "").strip() else "content"),
-                      "adapter": cfg.get("adapter", "generic"), "ok": bool(res.get("ok")),
-                      "score": score, "metric": res.get("metric", "configured_score"),
-                      "diagnostics": res.get("diagnostics") or {}, "error": res.get("error", "")}
-        db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_{round_no}", json.dumps(diagnostic, ensure_ascii=False))
-        if not res.get("ok"):
-            if best_score is None:
-                db.upsert_asset(pid, f"zhuque_{idx}_latest", json.dumps(diagnostic, ensure_ascii=False))
-                db.execute("UPDATE generated SET status='check_failed', zhuque_score=NULL, updated_at=? WHERE project_id=? AND idx=?",
-                           (db.now(), pid, idx))
-            add_warning(pid, f"第 {idx} 章{'候选编辑稿' if pending_text is not None else ''}朱雀检测失败：{res.get('error', '')}；已有正文和已验证结果均保留。")
+        text = _chapter_text(row)
+        diagnostic = {"chapter": idx, "round": 1, "checked_at": db.now(),
+                      "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                      "text_chars": len(text), "applied": False, "source": "content",
+                      "adapter": cfg.get("adapter", "generic"), "ok": False, "score": None,
+                      "balance": None, "manual_fallback": True,
+                      "labels_ratio": {},
+                      "error": "API 自动检测未启用，请复制正文到朱雀网页检测并记录分数。"}
+        previous_score = row.get("zhuque_score")
+        previous_status = row.get("status")
+        if previous_score is not None and previous_status in {"checked", "medium_aigc", "high_aigc"}:
+            human = round(max(0.0, 100 - float(previous_score)), 1)
+            diagnostic.update({"score": previous_score, "ok": True, "manual": True,
+                               "source": "retained", "human_rate": human,
+                               "error": "API 自动检测未启用，保留上次分数。"})
+            db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_0", json.dumps(diagnostic, ensure_ascii=False))
+            db.upsert_asset(pid, f"zhuque_{idx}_latest", json.dumps(diagnostic, ensure_ascii=False))
+            db.execute("UPDATE generated SET status=?, updated_at=? WHERE project_id=? AND idx=?",
+                       (_zhuque_status(float(previous_score)), db.now(), pid, idx))
+            add_warning(pid, f"第 {idx} 章未调用朱雀 API，保留上次分数 {previous_score}（人工率 {human}%）。")
             return
-        if not promote:
-            add_warning(pid, f"第 {idx} 章自然编辑未改善检测结果（{best_score} → {score}），已保留较低分原稿，停止本轮重复改写。")
-            return
-        passed = score <= threshold
-        if pending_text is not None:
-            _backup_chapter(pid, idx, row, task_id, f"natural_edit_{round_no}")
-            db.execute("UPDATE generated SET content=?, polished='', zhuque_score=?, status=?, updated_at=? WHERE project_id=? AND idx=?",
-                       (pending_text, score, "checked" if passed else "high_aigc", db.now(), pid, idx))
-            _invalidate_contexts(pid, idx)
-        else:
-            db.execute("UPDATE generated SET zhuque_score=?, status=?, updated_at=? WHERE project_id=? AND idx=?",
-                       (score, "checked" if passed else "high_aigc", db.now(), pid, idx))
+        db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_0", json.dumps(diagnostic, ensure_ascii=False))
         db.upsert_asset(pid, f"zhuque_{idx}_latest", json.dumps(diagnostic, ensure_ascii=False))
-        best_score = score
-        if passed or round_no >= max_rounds:
+        db.execute("UPDATE generated SET status='await_check', updated_at=? WHERE project_id=? AND idx=?",
+                   (db.now(), pid, idx))
+        return
+    row = _gen_row(pid, idx)
+    if not row:
+        return
+    text = _chapter_text(row)
+    tick(task_id, message=f"第 {idx} 章朱雀检测（自动检测 1 次）")
+    res = await zhuque.detect(text)
+    _ensure_unchanged(pid, idx, row)
+    score = res.get("score")
+    balance = res.get("balance")
+    threshold = 60
+    try:
+        low_balance = balance is not None and float(balance) < float(cfg.get("balance_minimum", 1))
+    except (TypeError, ValueError):
+        low_balance = False
+    switch_to_manual = bool(res.get("manual_fallback")) or low_balance
+    manual_fallback = bool(res.get("manual_fallback")) or (low_balance and not res.get("ok"))
+    if switch_to_manual and cfg.get("mode") == "api":
+        live_cfg = config.load()
+        live_cfg.setdefault("zhuque", {})["mode"] = "manual"
+        config.save(live_cfg)
+    diagnostic = {
+        "chapter": idx, "round": 1, "checked_at": db.now(),
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "text_chars": len(text), "applied": False, "source": "content",
+        "adapter": cfg.get("adapter", "generic"), "ok": bool(res.get("ok")),
+        "score": score, "balance": balance, "manual_fallback": manual_fallback,
+        "labels_ratio": res.get("labels_ratio") or (res.get("diagnostics") or {}).get("labels_ratio") or {},
+        "makers_usage_tokens": res.get("makers_usage_tokens"),
+        "manual_mode_next": switch_to_manual,
+        "metric": res.get("metric", "configured_score"),
+        "diagnostics": res.get("diagnostics") or {}, "error": res.get("error", ""),
+    }
+    db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_0", json.dumps(diagnostic, ensure_ascii=False))
+    if balance is not None:
+        db.upsert_asset(pid, "zhuque_balance_latest", json.dumps({"balance": balance, "checked_at": db.now()}, ensure_ascii=False))
+    if not res.get("ok") or score is None:
+        previous_score = row.get("zhuque_score")
+        previous_status = row.get("status")
+        if previous_score is not None and previous_status in {"checked", "medium_aigc"}:
+            db.upsert_asset(pid, f"zhuque_{idx}_{task_id}_error", json.dumps(diagnostic, ensure_ascii=False))
+            add_warning(pid, f"第 {idx} 章本次朱雀检测未成功（{res.get('error', '') or '未知原因'}），保留上次分数 {previous_score}。")
             return
-        tick(task_id, message=f"第 {idx} 章疑似 AI 占比 {score}，正在编辑候选稿，检测改善后再替换")
-        try:
-            memory = _chapter_memory(pid, idx, _get_constitution(pid)["content"], editing=True)
-        except ValueError as exc:
-            add_warning(pid, f"第 {idx} 章检测分已记录，缺少编辑依据，已跳过自动改写：{exc}")
-            return
-        row = _gen_row(pid, idx)
-        original = _chapter_text(row)
-        system, user = prompts.de_aigc(original, score, threshold, round_no, memory=memory)
-        new_text = await llm.chat("polish", system, user, project_id=pid,
-                                  max_tokens=min(8000, max(3000, int(words * 2.2))), temperature=0.85)
-        try:
-            pending_text = await _prepare_candidate(task_id, pid, idx, new_text, original)
-        except ChapterOutputError:
-            return
-        _ensure_unchanged(pid, idx, row)
+        status = "await_check" if manual_fallback else "check_failed"
+        db.execute("UPDATE generated SET zhuque_score=NULL, status=?, updated_at=? WHERE project_id=? AND idx=?",
+                   (status, db.now(), pid, idx))
+        db.upsert_asset(pid, f"zhuque_{idx}_latest", json.dumps(diagnostic, ensure_ascii=False))
+        add_warning(pid, f"第 {idx} 章朱雀未完成自动过检：{res.get('error', '') or '请复制到朱雀网页检测并记录分数。'}")
+        return
+
+    original_text = text
+    original_score = float(score)
+    repair_target = float(cfg.get("repair_target") or 50)
+    repair_rounds = int(cfg.get("repair_rounds") or cfg.get("max_rounds") or 0)
+    if bool(cfg.get("repair_enabled", True)) and original_score >= repair_target and repair_rounds > 0:
+        repaired_text, repaired_score, repaired_res, repaired = await _repair_flagged_segments(
+            task_id, pid, idx, original_text, original_score, res, repair_target, repair_rounds)
+        if repaired:
+            try:
+                _ensure_unchanged(pid, idx, row)
+            except ValueError as exc:
+                add_warning(pid, f"第 {idx} 章自动压缩未保存：{exc}")
+            else:
+                _backup_chapter(pid, idx, row, task_id, "auto_repair")
+                db.execute("UPDATE generated SET content=?, polished='', zhuque_score=?, status=?, updated_at=? "
+                           "WHERE project_id=? AND idx=?",
+                           (repaired_text, repaired_score, _zhuque_status(repaired_score), db.now(), pid, idx))
+                _invalidate_contexts(pid, idx)
+                text = repaired_text
+                score = repaired_score
+                res = repaired_res
+                balance = res.get("balance", balance)
+                diagnostic.update({
+                    "score": score,
+                    "text_chars": len(text),
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "applied": True,
+                    "diagnostics": res.get("diagnostics") or diagnostic.get("diagnostics") or {},
+                    "makers_usage_tokens": res.get("makers_usage_tokens"),
+                    "error": "",
+                })
+                add_warning(pid, f"第 {idx} 章已自动压缩高风险段：{original_score} → {score}")
+
+    status = _zhuque_status(float(score))
+    db.execute("UPDATE generated SET zhuque_score=?, status=?, updated_at=? WHERE project_id=? AND idx=?",
+               (score, status, db.now(), pid, idx))
+    db.upsert_asset(pid, f"zhuque_{idx}_latest", json.dumps(diagnostic, ensure_ascii=False))
+    if switch_to_manual:
+        add_warning(pid, f"朱雀积分余额低或调用额度不足（当前 {balance}），后续章节已切换网页手动检测。" +
+                    ("本章 API 检测已成功。" if res.get("ok") else f"第 {idx} 章请复制正文到网页免费检测并记录分数。"))
+    elif float(score) > threshold:
+        add_warning(pid, f"第 {idx} 章朱雀 {score} 分（人工率 {max(0.0, 100 - float(score)):.1f}%），超过 60 分，暂不能生成下一章。")
+
+
+async def _zhuque_loop(task_id: int, pid: int, idx: int, words: int,
+                       continue_on_no_improvement: bool = False) -> None:
+    """兼容旧调用名：检测当前正文一次，只记录报告，不按分数自动改写。"""
+    del words, continue_on_no_improvement
+    await _auto_zhuque_check(task_id, pid, idx)
 
 
 async def _build_context(task_id: int, pid: int, b: int, group: list[dict],
@@ -1028,10 +1216,6 @@ async def _build_context(task_id: int, pid: int, b: int, group: list[dict],
         (pid, b, json.dumps(data, ensure_ascii=False),
          json.dumps(normalized_deviations, ensure_ascii=False), db.now()),
     )
-    for d in normalized_deviations:
-        if d.get("level") == "重":
-            chapter = f"第 {d['chapter']} 章" if d.get("chapter") else f"第 {b + 1} 批（未定位章节）"
-            add_warning(pid, f"{chapter}偏离：{d.get('issue', '')}（建议：{d.get('suggestion', '')}）")
     return data
 
 
@@ -1201,7 +1385,6 @@ async def write_one_chapter(task_id: int, pid: int, plan_row: dict, group: list[
              updated_at=excluded.updated_at""",
         (pid, idx, title, body, b, db.now()),
     )
-    await _zhuque_loop(task_id, pid, idx, words)
 
 
 async def run_write(task_id: int, pid: int, payload: dict) -> None:
@@ -1217,52 +1400,75 @@ async def run_write(task_id: int, pid: int, payload: dict) -> None:
     groups = _plan_groups(plan, size)
 
     mode = payload.get("mode", "next")
-    if payload.get("batch") is not None:
-        targets = [int(payload["batch"])]
-    elif mode == "all":
-        targets = [i for i, g in enumerate(groups) if not _batch_complete(pid, g)]
+    # 正文永远以“章”为最小任务单位。每个写作任务只生成一章，
+    # 用户检查、复制检测或修改后，再决定是否开始下一章。
+    chapter_map = {int(row["idx"]): (b, group, row)
+                   for b, group in enumerate(groups) for row in group}
+    if payload.get("idx") is not None:
+        requested = [int(payload["idx"])]
+    elif payload.get("batch") is not None:  # 兼容旧客户端：单次只处理该批一章
+        group = groups[int(payload["batch"])] if 0 <= int(payload["batch"]) < len(groups) else []
+        if payload.get("force"):
+            requested = [int(row["idx"]) for row in group[:1]]
+        else:
+            requested = [int(row["idx"]) for row in group
+                         if not ((_gen_row(pid, int(row["idx"])) or {}).get("content") or "").strip()][:1]
+    elif mode == "all":  # 兼容旧任务：降级为只写下一章
+        requested = [int(row["idx"]) for row in plan
+                     if not ((_gen_row(pid, int(row["idx"])) or {}).get("content") or "").strip()][:1]
     elif mode == "range":
-        start_b = int(payload.get("start", 0))
-        end_b = int(payload.get("end", start_b))
-        targets = list(range(start_b, min(end_b, len(groups) - 1) + 1))
+        start_idx = int(payload.get("start", 1))
+        end_idx = int(payload.get("end", start_idx))
+        requested = [int(row["idx"]) for row in plan if start_idx <= int(row["idx"]) <= end_idx]
     else:
-        targets = []
-        for i, g in enumerate(groups):
-            if not _batch_complete(pid, g):
-                targets = [i]
-                break
+        requested = [int(row["idx"]) for row in plan
+                     if not ((_gen_row(pid, int(row["idx"])) or {}).get("content") or "").strip()][:1]
+    targets = [idx for idx in requested if idx in chapter_map]
     if not targets:
         tick(task_id, progress=1, total=1, message="所有章节都已经写完了")
         return
 
-    total_chapters = sum(len(groups[b]) for b in targets if 0 <= b < len(groups))
+    force = bool(payload.get("force"))
+    if not force:
+        targets = [idx for idx in targets
+                   if not ((_gen_row(pid, idx) or {}).get("content") or "").strip()]
+    # 防止旧版客户端或恢复任务携带 all/range/batch 时一次跑多章。
+    targets = targets[:1]
+    if not targets:
+        tick(task_id, progress=1, total=1, message="所有章节都已经写完了")
+        return
+    total_chapters = len(targets)
     done = 0
-    for b in targets:
-        if b < 0 or b >= len(groups):
-            continue
-        group = groups[b]
-        # 前一批必须完成，保证上下文连续
-        if b > 0 and not _batch_complete(pid, groups[b - 1]):
-            raise ValueError(f"第 {b} 批之前还有没写完的章节，请先按顺序完成第 {b} 批。")
+    for idx in targets:
+        b, group, row_plan = chapter_map[idx]
+        # 章节按顺序推进，避免跳过上一章导致记忆缺口。
+        if idx > 1:
+            previous = _gen_row(pid, idx - 1)
+            if not previous or not (previous.get("content") or "").strip():
+                raise ValueError(f"第 {idx} 章之前还有未生成的正文，请先完成第 {idx - 1} 章。")
+            if not _chapter_passed(previous, cfg.get("zhuque", {})):
+                score = previous.get("zhuque_score")
+                raise ValueError(f"第 {idx - 1} 章朱雀分数必须不高于 60 分（当前 {score if score is not None else '未检测'}），请先完成检测。")
         ctx = _last_context(pid, b)
-        if b > 0 and not ctx:
+        if b > 0 and not ctx and _batch_complete(pid, groups[b - 1]):
             tick(task_id, message=f"缺少第 {b} 批承接卡，正在补建")
             ctx = await _build_context(task_id, pid, b - 1, groups[b - 1], cons["content"])
         db.set_batch(pid, "write", b, "running")
         try:
-            for row_plan in group:
-                existing = _gen_row(pid, row_plan["idx"])
-                if existing and (existing.get("content") or "").strip() and not payload.get("force"):
-                    done += 1
-                    continue
-                await write_one_chapter(task_id, pid, row_plan, group, b, cons["content"],
-                                        book, words, ctx)
-                done += 1
-                tick(task_id, progress=done, total=total_chapters,
-                     message=f"第 {row_plan['idx']} 章完成（{done}/{total_chapters}）")
-            tick(task_id, message=f"第 {b + 1} 批写完，正在生成承接卡")
-            ctx = await _build_context(task_id, pid, b, group, cons["content"])
-            db.set_batch(pid, "write", b, "done")
+            await write_one_chapter(task_id, pid, row_plan, group, b, cons["content"],
+                                    book, words, ctx)
+            # 通过正式写作任务落库后自动检测一次；单元级写作函数仍可独立复用。
+            await _auto_zhuque_check(task_id, pid, idx)
+            done += 1
+            tick(task_id, progress=done, total=total_chapters,
+                 message=f"第 {idx} 章完成（{done}/{total_chapters}），已保存，可继续下一章")
+            # 承接卡仍按原有分析批次维护，但只有该批最后一章完成后才生成。
+            if _batch_complete(pid, group):
+                tick(task_id, message=f"第 {b + 1} 批章节已齐，正在生成承接卡")
+                await _build_context(task_id, pid, b, group, cons["content"])
+                db.set_batch(pid, "write", b, "done")
+            else:
+                db.set_batch(pid, "write", b, "pending")
             db.execute("UPDATE projects SET status='writing', updated_at=? WHERE id=?", (db.now(), pid))
         except Paused:
             db.set_batch(pid, "write", b, "paused")
@@ -1287,7 +1493,7 @@ async def run_check(task_id: int, pid: int, payload: dict) -> None:
     failed = 0
     for i, idx in enumerate(idxs, 1):
         tick(task_id, progress=i - 1, total=len(idxs), message=f"检测第 {idx} 章")
-        await _zhuque_loop(task_id, pid, int(idx), words)
+        await _auto_zhuque_check(task_id, pid, int(idx))
         row = _gen_row(pid, int(idx))
         is_failed = row and row.get("status") == "check_failed"
         failed += int(bool(is_failed))
@@ -1303,11 +1509,13 @@ async def run_rewrite(task_id: int, pid: int, payload: dict) -> None:
         raise ValueError(f"第 {idx} 章还不存在。")
     book_title = new_book_title(pid)
     cons = _get_constitution(pid)
-    instruction = payload.get("instruction") or ""
+    naturalize = payload.get("style") == "natural"
+    instruction = prompts.NATURAL_EDIT_INSTRUCTION if naturalize else (payload.get("instruction") or "")
     prev = _prev_chapter(pid, idx)
     prev_tail = _chapter_text(prev)[-1800:] if prev else ""
     memory = _chapter_memory(pid, idx, cons["content"], editing=True)
-    tick(task_id, progress=0, total=2, message=f"已读取大纲、章节计划及前五章剧情，正在重写第 {idx} 章")
+    action = "自然点化" if naturalize else "重写"
+    tick(task_id, progress=0, total=2, message=f"已读取大纲、章节计划及前五章剧情，正在{action}第 {idx} 章")
     system, user = prompts.rewrite_chapter(book_title, cons["content"], _chapter_text(row),
                                            instruction, prev_tail, memory=memory)
     words = int(config.load()["writing"].get("words_per_chapter") or 2600)
@@ -1315,12 +1523,13 @@ async def run_rewrite(task_id: int, pid: int, payload: dict) -> None:
                           max_tokens=min(8000, max(3000, int(words * 2.2))), temperature=0.75)
     body = await _prepare_candidate(task_id, pid, idx, text, _chapter_text(row))
     _ensure_unchanged(pid, idx, row)
-    _backup_chapter(pid, idx, row, task_id, "rewrite")
+    _backup_chapter(pid, idx, row, task_id, "natural_edit" if naturalize else "rewrite")
     _invalidate_contexts(pid, idx)
     db.execute("UPDATE generated SET content=?, polished='', zhuque_score=NULL, status='rewritten', updated_at=? "
                "WHERE project_id=? AND idx=?", (body, db.now(), pid, idx))
-    tick(task_id, progress=1, message="重写完成，正在重新检测")
-    await _zhuque_loop(task_id, pid, idx, words)
+    zhuque_cfg = config.load().get("zhuque", {})
+    await _auto_zhuque_check(task_id, pid, idx)
+    tick(task_id, progress=1, message="重写完成，朱雀结果已记录或已转人工网页检测")
     outline_row = db.q1("SELECT content FROM outline WHERE project_id=?", (pid,))
     plan = utils.parse_plan((outline_row or {}).get("content", ""))
     size = int(config.load()["writing"].get("batch_size") or 5)
@@ -1328,7 +1537,19 @@ async def run_rewrite(task_id: int, pid: int, payload: dict) -> None:
         if any(r["idx"] == idx for r in group):
             await _build_context(task_id, pid, b, group, cons["content"])
             break
-    tick(task_id, progress=2, total=2, message="重写完成，承接卡已更新")
+    fresh = _gen_row(pid, idx) or {}
+    score = fresh.get("zhuque_score")
+    if score is not None:
+        human = max(0.0, min(100.0, 100 - float(score)))
+        if float(score) < 50:
+            result_note = f"朱雀 {score} 分，人工率 {human:.1f}%，已通过"
+        elif float(score) <= 60:
+            result_note = f"朱雀 {score} 分，人工率 {human:.1f}%，疑似人工，可继续"
+        else:
+            result_note = f"朱雀 {score} 分，人工率 {human:.1f}%，超过 60%，需先处理"
+    else:
+        result_note = "等待完成检测"
+    tick(task_id, progress=2, total=2, message=f"{action}完成，{result_note}；承接卡已更新")
 
 
 def _invalidate_contexts(pid: int, idx: int) -> None:
@@ -1410,7 +1631,7 @@ async def realign_batch(task_id: int, pid: int, batch: int) -> None:
         # 顺序落库：校准下一章时读取上一章刚保存的版本。
         db.execute("UPDATE generated SET content=?, polished='', status='draft', zhuque_score=NULL, updated_at=? WHERE project_id=? AND idx=?",
                    (body, db.now(), pid, idx))
-        await _zhuque_loop(task_id, pid, idx, words)
+        # 校准结果直接保存，不自动调用朱雀。
         staged.append(idx)
     if not staged:
         raise ValueError("没有得到可用的校准正文，原稿均已保留。")

@@ -29,7 +29,8 @@ DEFAULT_CONFIG: dict = {
     },
     "zhuque": {
         "enabled": False,
-        "mode": "api",  # api | manual
+        "mode": "api",  # api：生成后自动检测；manual：网页检测后录分
+        "auto_detect": True,
         "adapter": "generic",  # generic | makers | tencent（专属网关）
         "api_key": "",
         "work_mode": "async",  # 腾讯云：async | sync
@@ -39,7 +40,12 @@ DEFAULT_CONFIG: dict = {
         "body_template": "{\"text\": \"{{text}}\"}",
         "score_path": "data.score",
         "score_scale": 100,  # 返回值满分，如 1 表示 0-1 小数
-        "pass_threshold": 20,
+        "pass_threshold": 60,  # 分数高于该值才限制生成下一章
+        "repair_enabled": True,  # 生成后自动压缩被朱雀标为 AI 的高风险段落
+        "repair_target": 50,  # 人工率高于 50% 即标绿；自动压缩降到该分以下就停
+        "repair_rounds": 2,  # 自动压缩最多尝试几处段落
+        "balance_path": "",  # 可选：返回 JSON 中的积分/余额字段路径
+        "balance_minimum": 1,  # 低于该余额时提示切换网页免费额度
         "max_rounds": 2,
         "timeout": 60,
     },

@@ -436,6 +436,30 @@ class PartialWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(db.q1('SELECT content FROM generated')['content'])
         self.assertEqual(db.q1("SELECT COUNT(*) c FROM batches WHERE kind='detail' AND status='pending'")['c'], 3)
 
+    async def test_write_task_generates_only_one_chapter_even_for_legacy_all_mode(self):
+        self.save_outline(
+            '# 新书\n<!--PLAN\n'
+            '1|开端|查案|遇到阻碍|脚步声\n'
+            '2|追踪|找到证人|证人隐瞒|门外有人\n'
+            '3|反转|发现线索|线索指向盟友|电话响起\nPLAN-->'
+        )
+        calls = []
+
+        async def write(tid, pid, row, *args):
+            calls.append(row['idx'])
+            db.execute('INSERT INTO generated(project_id,idx,title,content) VALUES(?,?,?,?)',
+                       (pid, row['idx'], row['title'], f'第{row["idx"]}章正文' * 100))
+
+        with patch.object(pipeline, 'write_one_chapter', side_effect=write), \
+             patch.object(pipeline, '_build_context', AsyncMock(return_value={})):
+            await pipeline.run_write(self.tid, self.pid, {'mode': 'all'})
+            self.assertEqual(calls, [1])
+            db.execute("UPDATE generated SET status='checked', zhuque_score=19 WHERE project_id=? AND idx=1",
+                       (self.pid,))
+            await pipeline.run_write(self.tid, self.pid, {'mode': 'next'})
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual([r['idx'] for r in db.q('SELECT idx FROM generated ORDER BY idx')], [1, 2])
+
     async def test_context_rebuild_persists_chapter_evidence_and_next_batch_action(self):
         db.execute('INSERT INTO generated(project_id,idx,title,content) VALUES(?,?,?,?)',
                    (self.pid, 1, '冲突', '主角明明约好独自赴约，却带了整个小队。' * 30))

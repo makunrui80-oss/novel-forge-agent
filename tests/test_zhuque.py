@@ -15,7 +15,7 @@ class ZhuqueTests(unittest.IsolatedAsyncioTestCase):
     def settings(self, **changes):
         return {'enabled': True, 'mode': 'api', 'adapter': 'tencent',
                 'endpoint': 'https://gateway.test', 'api_key': 'test-secret',
-                'work_mode': 'async', 'timeout': 60, 'pass_threshold': 20, **changes}
+                'work_mode': 'async', 'timeout': 60, 'pass_threshold': 60, **changes}
 
     async def detect(self, settings, replies, text='小说正文'):
         requests = []
@@ -48,12 +48,23 @@ class ZhuqueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_makers_key_uses_fixed_official_endpoint_and_sync_protocol(self):
         result, requests = await self.detect(self.settings(adapter='makers', endpoint='https://detector.example.com/check'),
-            [{'status': 'success', 'ratio_confidence': 0, 'makers_models_usage': {'total_tokens': 30}}])
+            [{'status': 'success', 'ratio_confidence': 0,
+              'labels_ratio': {'0': .35, '1': .2, '2': .45},
+              'makers_models_usage': {'total_tokens': 30}}])
         self.assertTrue(result['ok'])
         self.assertEqual(result['score'], 0)
+        self.assertEqual(result['makers_usage_tokens'], 30)
+        self.assertEqual(result['labels_ratio'], {'0': .35, '1': .2, '2': .45})
         self.assertEqual(str(requests[0].url), zhuque.MAKERS_ENDPOINT)
         self.assertNotIn('Work-Mode', requests[0].headers)
         self.assertEqual(len(requests), 1)
+
+    async def test_labels_ratio_normalizes_fraction_and_percent_payloads(self):
+        result, _ = await self.detect(self.settings(adapter='makers'), [{
+            'status': 'success', 'ratio_confidence': .41,
+            'labels_ratio': {'0': 24, '1': 31.5, '2': 44.5},
+        }])
+        self.assertEqual(result['labels_ratio'], {'0': .24, '1': .315, '2': .445})
 
     async def test_async_queries_same_task_and_decodes_string_output(self):
         result, requests = await self.detect(self.settings(), [
@@ -85,6 +96,16 @@ class ZhuqueTests(unittest.IsolatedAsyncioTestCase):
                 result, _ = await self.detect(self.settings(work_mode='sync'), [reply])
                 self.assertFalse(result['ok'])
                 self.assertIsNone(result['score'])
+
+    async def test_exactly_60_passes_and_above_60_does_not(self):
+        at_limit, _ = await self.detect(self.settings(work_mode='sync'), [
+            {'status': 'success', 'ratio_confidence': .60},
+        ])
+        above_limit, _ = await self.detect(self.settings(work_mode='sync'), [
+            {'status': 'success', 'ratio_confidence': .601},
+        ])
+        self.assertTrue(at_limit['pass'])
+        self.assertFalse(above_limit['pass'])
 
     async def test_task_failure_and_invalid_output_stop_polling(self):
         for reply in ({'Status': 'FAILED'}, {'Status': 'SUCCEEDED', 'Output': 'invalid'}, {'Status': 'unknown'}):

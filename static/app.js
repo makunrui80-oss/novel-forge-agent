@@ -13,6 +13,7 @@ const S = {
   tasks: [],
   config: null,
   spent: 0,
+  zhuqueBalance: null,
   req: {},
   openBatches: new Set(),
   reader: null,
@@ -32,13 +33,32 @@ const STATUS = {
   done: ['完成', 'ok'], failed: ['失败', 'bad'], archive_failed: ['档案失败', 'bad'], canceled: ['已取消', ''],
   uploaded: ['已上传', ''], analyzed: ['已拆书', 'ok'], outlined: ['已出大纲', 'accent'],
   writing: ['写作中', 'accent'], polished: ['已优化', 'ok'], created: ['新建', ''],
-  draft: ['草稿', ''], checked: ['已过检', 'ok'], high_aigc: ['AIGC偏高', 'bad'],
+  draft: ['草稿', ''], checked: ['朱雀已通过', 'ok'], medium_aigc: ['朱雀疑似人工', 'warn'], high_aigc: ['朱雀高风险', 'bad'],
   await_check: ['待人工检测', 'warn'], check_failed: ['检测失败', 'warn'],
   rewritten: ['已改写', 'accent'], polished_ch: ['已优化', 'ok'], paused_batch: ['已暂停', 'warn'],
 };
 const statusChip = (s) => {
   const [label, cls] = STATUS[s] || [s, ''];
   return `<span class="chip ${cls}">${esc(label)}</span>`;
+};
+
+const zhuqueScoreClass = (score) => score == null ? '' : (Number(score) < 50 ? 'ok' : (Number(score) <= 60 ? 'warn' : 'bad'));
+const zhuqueCanContinue = (chapter) => {
+  if (!chapter || !['checked', 'medium_aigc', 'high_aigc'].includes(chapter.status)) return false;
+  const score = Number(chapter.zhuque_score);
+  return Number.isFinite(score) && score <= 60;
+};
+const zhuqueRatiosHtml = (detection) => {
+  if (!detection?.matches_current) return '';
+  const ratios = detection.labels_ratio || detection.diagnostics?.labels_ratio || {};
+  const labels = [['0', '人工内容'], ['1', 'AI内容'], ['2', '疑似AI内容']];
+  const values = labels.map(([key, label]) => {
+    let value = Number(ratios[key]);
+    if (!Number.isFinite(value)) return '';
+    if (value > 1) value /= 100;
+    return `<span class="chip">${label} ${(Math.max(0, Math.min(1, value)) * 100).toFixed(1)}%</span>`;
+  }).filter(Boolean);
+  return values.length ? `<div class="meta zhuque-ratios">${values.join('')}</div>` : '';
 };
 
 const num = (n) => Number(n || 0).toLocaleString('zh-CN');
@@ -299,6 +319,7 @@ async function loadView(view, force = false) {
       const cfg = await api('/api/config');
       S.config = cfg.config;
       S.spent = cfg.spent;
+      S.zhuqueBalance = cfg.zhuque_balance;
     }
     renderView();
   } catch (err) {
@@ -348,7 +369,7 @@ async function liveTick() {
       api(`/api/tasks?project_id=${S.pid}`),
     ]);
     const running = ts.tasks.some((t) => t.status === 'running');
-    const sig = JSON.stringify(ts.tasks.map((t) => [t.id, t.status, t.progress])) +
+    const sig = JSON.stringify(ts.tasks.map((t) => [t.id, t.status, t.progress, t.message])) +
       JSON.stringify(ov.stats);
     const changed = sig !== S.lastTaskSig;
     S.lastTaskSig = sig;
@@ -607,27 +628,27 @@ async function handleAction(act, el) {
     toast('已解锁，修改后请重新锁定', 'warn');
     return renderView();
   }
-  if (act === 'write-next' || act === 'write-all') {
-    if (act === 'write-all') {
-      const st = S.overview?.stats || {};
-      const left = (st.plan_total || 0) - (st.written || 0);
-      if (left > 10 && !confirm(`还有 ${left} 章要写，会连续调用模型，确定自动写完？`)) return;
-    }
-    await post(`/api/projects/${pid}/write`, { mode: act === 'write-all' ? 'all' : 'next' });
-    toast('写作任务已入队', 'ok');
+  if (act === 'write-next') {
+    await post(`/api/projects/${pid}/write`, { mode: 'next' });
+    toast('下一章写作任务已入队', 'ok');
     return loadView(S.view);
   }
-  if (act === 'write-batch') {
-    const b = Number(el.dataset.batch);
-    if (!confirm(`会重新生成第 ${b + 1} 批的全部章节，覆盖现有正文和承接卡，确定继续？`)) return;
-    await post(`/api/projects/${pid}/write`, { mode: 'batch', batch: b, force: true });
-    toast(`第 ${b + 1} 批重新生成已入队`, 'warn');
+  if (act === 'write-chapter') {
+    const idx = Number(el.dataset.idx);
+    const existing = (S.generated || []).find((g) => g.idx === idx);
+    if (existing && !confirm(`确定只重新生成第 ${idx} 章吗？当前正文会自动备份。`)) return;
+    await post(`/api/projects/${pid}/write`, { mode: 'chapter', idx, force: !!existing });
+    toast(existing ? `第 ${idx} 章重新生成已入队` : `第 ${idx} 章生成已入队`, 'ok');
     return loadView(S.view);
   }
   if (act === 'open-chapter') {
     return openReader(Number(el.dataset.id));
   }
   if (act === 'check-all') {
+    if (S.config?.zhuque?.mode === 'manual') {
+      toast('当前为网页手动检测模式；复制正文到朱雀网页检测即可', 'warn');
+      return;
+    }
     if (!S.config?.zhuque?.enabled) {
       toast('朱雀检测还没启用，请先到设置页配置', 'warn');
       switchView('settings');
@@ -654,7 +675,7 @@ async function handleAction(act, el) {
   }
   if (act === 'task-pause') {
     await post(`/api/tasks/${el.dataset.id}/pause`);
-    toast('已暂停，当前批次完成后停止', 'warn');
+    toast('已暂停，当前章节处理后停止', 'warn');
     return loadView(S.view);
   }
   if (act === 'task-resume') {
@@ -680,6 +701,21 @@ async function handleAction(act, el) {
     closeModal();
     return loadView(S.view);
   }
+  if (act === 'naturalize-chapter') {
+    const idx = Number(el.dataset.idx);
+    if ($('#readerContent') && S.reader?.idx === idx) {
+      const tab = $('#readerTab')?.dataset.tab || 'content';
+      const savedText = tab === 'polished' ? (S.reader.polished || S.reader.content) : S.reader.content;
+      if ($('#readerContent').value !== savedText || $('#readerTitle').value !== S.reader.title) {
+        toast('请先保存当前修改，再进行自然点化', 'warn');
+        return;
+      }
+    }
+    await post(`/api/projects/${pid}/rewrite`, {idx, style: 'natural'});
+    toast('自然点化已入队：先读前章剧情，修整对白与叙述节奏，再检测结果', 'ok');
+    closeModal();
+    return loadView(S.view);
+  }
   if (act === 'rewrite-chapter') {
     const idx = Number(el.dataset.idx);
     const instruction = $('#rewriteInstruction')?.value || '';
@@ -689,17 +725,37 @@ async function handleAction(act, el) {
     return loadView(S.view);
   }
   if (act === 'recheck-chapter') {
+    if (S.config?.zhuque?.mode === 'manual') {
+      toast('当前为网页手动检测模式，请复制正文到朱雀网页检测后记录分数', 'warn');
+      return;
+    }
     const idx = Number(el.dataset.idx);
     await post(`/api/projects/${pid}/check`, { idxs: [idx] });
     toast('已提交朱雀检测', 'ok');
+    return;
+  }
+  if (act === 'copy-chapter') {
+    const text = $('#readerContent')?.value || '';
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+      else {
+        const input = $('#readerContent'); input?.focus(); input?.select();
+        if (!document.execCommand('copy')) throw new Error('复制失败');
+      }
+      toast('本章正文已复制，可以粘贴到朱雀网页检测', 'ok');
+    } catch {
+      toast('自动复制失败，请选中正文后手动复制', 'warn');
+    }
     return;
   }
   if (act === 'record-score') {
     const gid = Number(el.dataset.id);
     const score = Number($('#manualScore').value);
     if (!Number.isFinite(score)) { toast('请输入检测分', 'warn'); return; }
-    await put(`/api/generated/${gid}/score`, { score });
-    toast('检测分已记录', 'ok');
+    const text = $('#readerContent')?.value || '';
+    const result = await put(`/api/generated/${gid}/score`, { score, text });
+    toast(result.message || (result.pass ? '检测分已记录，可生成下一章' : '检测分已记录；超过 60 分，暂不能生成下一章'), result.pass ? 'ok' : 'warn');
+    await loadView(S.view);
     return openReader(gid);
   }
   if (act === 'reader-tab') {
@@ -721,7 +777,9 @@ async function handleAction(act, el) {
     el.disabled = true;
     try {
       const res = await post('/api/zhuque/test', {settings: S.config.zhuque});
-      resultEl.textContent = res.ok ? `检测成功：疑似 AI 占比 ${res.score} 分。启用自动检测并保存全部设置后，每章会自动检测。` : `检测失败：${res.error}`;
+      resultEl.textContent = res.ok
+        ? `检测成功：疑似 AI 占比 ${res.score} 分，人工率 ${Math.max(0, 100 - Number(res.score)).toFixed(1)}%${res.makers_usage_tokens != null ? '；本次扣减 ' + res.makers_usage_tokens + ' token' : ''}${res.balance != null ? '；剩余积分 ' + res.balance : '；本次响应未包含余额字段'}。生成章节时会自动检测一次。`
+        : `检测失败：${res.error}${res.balance != null ? '；剩余积分 ' + res.balance : ''}`;
       resultEl.style.color = res.ok ? 'var(--ok)' : 'var(--bad)';
     } catch (err) {
       resultEl.textContent = `检测失败：${err.message}`;
@@ -923,9 +981,9 @@ function renderDashboard() {
           <div class="card-head"><h2>快捷操作</h2></div>
           <div class="btn-row">
             <button class="btn sm" data-act="analyze-next">拆下一批</button>
-            <button class="btn sm" data-act="write-next">写下一批</button>
+            <button class="btn sm" data-act="write-next">生成下一章</button>
             <button class="btn sm" data-act="polish-all">全书优化</button>
-            <button class="btn sm" data-act="check-all">朱雀全检</button>
+            ${S.config?.zhuque?.mode === 'manual' || !S.config?.zhuque?.enabled ? '' : '<button class="btn sm" data-act="check-all">朱雀全检</button>'}
           </div>
           <p class="tiny muted" style="margin:12px 0 0">
             每批严格 5 章；批与批之间自动生成承接卡，人物状态、伏笔、上一章结尾都会带入下一批。
@@ -1192,7 +1250,7 @@ function renderOutline() {
       <div class="card">
         <div class="card-head">
           <h2>章节计划</h2>
-          <span class="hint">写作队列按此表每 5 章一批；共 ${S.plan.length} 章</span>
+          <span class="hint">写作按章节计划逐章生成；共 ${S.plan.length} 章</span>
         </div>
         ${S.plan.length && /<!--\s*PLAN/i.test(o.content) && !/PLAN\s*-->/i.test(o.content) ? '<div class="notice">大纲结尾可能被截断，已恢复其中可识别的章节计划，可以按这些计划开始写作；如需更多章节，可补充大纲后保存。</div>' : ''}
         ${S.plan.length ? `
@@ -1268,6 +1326,9 @@ function renderWrite() {
   const newTitle = currentNewTitle();
   const locked = st.constitution_locked;
   const genMap = new Map(S.generated.map((g) => [g.idx, g]));
+  const nextPlanRow = (S.plan || []).find((r) => !genMap.get(r.idx));
+  const previousForNext = nextPlanRow ? genMap.get(nextPlanRow.idx - 1) : null;
+  const nextBlocked = !!(nextPlanRow?.idx > 1 && !zhuqueCanContinue(previousForNext));
   const size = st.batch_size || 5;
   const plan = S.plan || [];
   const groups = [];
@@ -1276,53 +1337,49 @@ function renderWrite() {
   const warnings = (ov.warnings || []).slice(-5).reverse().map((w) => `<div class="notice">${esc(w.text)}</div>`).join('');
 
   const groupsHtml = groups.map((g, b) => {
-    const label = `第 ${b + 1} 批 · 第 ${g[0].idx}-${g[g.length - 1].idx} 章`;
+    const label = `承接单元 ${b + 1} · 第 ${g[0].idx}-${g[g.length - 1].idx} 章`;
     const done = g.every((r) => genMap.get(r.idx));
     const ctx = (S.contexts || []).find((c) => c.after_batch === b);
-    const devs = ctx?.data?.deviations || [];
     return `
       <div class="card" style="padding:16px 18px">
         <div class="card-head" style="margin-bottom:10px">
           <div style="display:flex;align-items:center;gap:10px">
             <h3>${label}</h3>
             ${done ? '<span class="chip ok">已完成</span>' : '<span class="chip">待写</span>'}
-            ${devs.length ? `<span class="chip bad">${devs.length} 条偏离</span>` : ''}
           </div>
           <div class="btn-row">
-            <button class="btn sm ghost" data-act="write-batch" data-batch="${b}">整批重生成</button>
-            ${done ? `<button class="btn sm ghost" data-act="context-rebuild" data-batch="${b}">${devs.length ? '重新承接并定位偏离' : '重建承接卡'}</button>` : ''}
+            ${done ? `<button class="btn sm ghost" data-act="context-rebuild" data-batch="${b}">重建承接卡</button>` : ''}
           </div>
         </div>
         <div class="chapter-grid">
           ${g.map((r) => {
             const gen = genMap.get(r.idx);
-            if (!gen) return `<div class="chapter-card" style="opacity:.5;cursor:default">
+            if (!gen) return `<div class="chapter-card" style="opacity:.8;cursor:default">
               <div class="idx">CH.${String(r.idx).padStart(2, '0')}</div>
               <div class="name">${esc(r.title)}</div>
               <div class="meta"><span class="chip">待写</span></div>
-              <div class="excerpt">${esc(r.event)}</div></div>`;
+              <div class="excerpt">${esc(r.event)}</div>
+              <button class="btn sm ghost" data-act="write-chapter" data-idx="${r.idx}" ${locked && (r.idx <= 1 || zhuqueCanContinue(genMap.get(r.idx - 1))) ? '' : 'disabled'}>生成本章</button>
+            </div>`;
             const score = gen.zhuque_score;
-            const sCls = score == null ? '' : (score <= (S.config?.zhuque?.pass_threshold || 20) ? 'ok' : 'bad');
+            const sCls = zhuqueScoreClass(score);
+            const zErr = String(gen.detection?.error || '').replace(/\s+/g, ' ').slice(0, 30);
             return `<div class="chapter-card" data-act="open-chapter" data-id="${gen.id}">
               <div class="idx">CH.${String(gen.idx).padStart(2, '0')}</div>
               <div class="name">${esc(gen.title || r.title)}</div>
               <div class="meta">
                 ${statusChip(gen.status)}
                 <span>${num(gen.words)} 字</span>
-                ${score != null ? `<span class="chip ${sCls}">AIGC ${score}</span>` : ''}
+                ${score != null ? `<span class="chip ${sCls}">朱雀 ${score} 分 · 人工率 ${Math.max(0, 100 - Number(score)).toFixed(1)}%</span>` : (zErr ? `<span class="chip warn" title="${esc(zErr)}">朱雀未返回 · ${esc(zErr)}</span>` : '<span class="chip">朱雀待检测</span>')}
               </div>
+              ${zhuqueRatiosHtml(gen.detection)}
               <div class="excerpt">${esc(gen.excerpt || '')}</div>
+              <button class="btn sm" data-act="naturalize-chapter" data-idx="${gen.idx}">一键自然点化</button>
+              <button class="btn sm ghost" data-act="write-chapter" data-idx="${gen.idx}" ${locked && (gen.idx <= 1 || zhuqueCanContinue(genMap.get(gen.idx - 1))) ? '' : 'disabled'}>重新生成本章</button>
             </div>`;
           }).join('')}
         </div>
-        ${devs.length ? `<div class="notice bad" style="margin-top:12px">
-          <strong>偏离章节定位</strong>
-          <div style="margin-top:8px">${devs.map((d) => {
-            const chapter = d.chapter ? `第 ${d.chapter} 章` : '未定位到具体章节（点击重新承接）';
-            return `<div style="margin-top:7px"><b>${esc(chapter)} · ${esc(d.level || '中')}</b>：${esc(d.issue)}${d.evidence ? `<br><span class="tiny">证据：${esc(d.evidence)}</span>` : ''}${d.suggestion ? `<br><span class="tiny">拉回：${esc(d.suggestion)}</span>` : ''}</div>`;
-          }).join('')}</div>
-        </div>` : ''}
-        ${ctx ? `<details class="raw" style="margin-top:12px"><summary>查看本批承接卡</summary>
+        ${ctx ? `<details class="raw" style="margin-top:12px"><summary>查看承接卡</summary>
           <pre>${esc(ctx.data?.context_card || '')}</pre>
         </details>` : ''}
       </div>`;
@@ -1334,16 +1391,17 @@ function renderWrite() {
     <div class="page-head">
       <div>
         <div class="page-eyebrow">NOVEL FORGE / 05 WRITING</div>
-        <h1>正文写作${newTitle ? ` · 《${esc(newTitle)}》` : ' · 5 章一批'}</h1>
-        <p class="page-desc">写的是新书${newTitle ? `《${esc(newTitle)}》` : ''}，参考书《${esc(refTitle())}》只用来对齐手法与节奏。逐章生成，写完立刻过朱雀；一批写完生成承接卡，把人物状态、伏笔、结尾钩子带进下一批。</p>
+        <h1>正文写作${newTitle ? ` · 《${esc(newTitle)}》` : ''}</h1>
+        <p class="page-desc">每次点击只生成并保存一章。生成后会自动调用朱雀检测一次；人工率高于 50% 标绿，疑似 AI 不超过 60% 可继续生成下一章，超过 60% 才限制。积分不足时，复制正文到朱雀网页免费检测并记录分数。</p>
       </div>
       <div class="btn-row">
-        <button class="btn" data-act="write-next" ${locked ? '' : 'disabled'}>继续下一批（5章）</button>
-        <button class="btn primary" data-act="write-all" ${locked ? '' : 'disabled'}>自动写完</button>
+        <button class="btn" data-act="write-next" ${locked && !nextBlocked ? '' : 'disabled'}>生成下一章</button>
       </div>
     </div>
 
     ${!locked ? `<div class="notice bad">创作宪法还没锁定，不能开始写作。<button class="btn sm" data-act="go" data-view="constitution" style="margin-left:10px">去确认锁定</button></div>` : ''}
+    ${nextBlocked ? '<div class="notice warn">上一章疑似 AI 超过 60%，或尚未完成检测；人工率高于 50% 标绿，疑似 AI 不超过 60% 可继续，超过 60% 才限制下一章。</div>' : ''}
+    ${S.config?.zhuque?.enabled && S.config?.zhuque?.mode === 'manual' ? '<div class="notice warn">朱雀 API 当前是网页手动检测模式（余额不足或手动关闭自动检测），不会自动返回分数。请复制正文到朱雀网页检测，再点章节窗口的「记录分数」。</div>' : ''}
     ${warnings}
 
     <div class="card">
@@ -1356,7 +1414,7 @@ function renderWrite() {
         ${statCard('已写章节', `${st.written}`, st.plan_total ? `计划 ${st.plan_total} 章` : '无计划')}
         ${statCard('总字数', wan(st.written_words), `目标 ${num(st.plan_total * (S.req.words || 2600))} 字`)}
         ${statCard('AIGC 均分', st.avg_zhuque ?? '—', '朱雀检测')}
-        ${statCard('批次', `${Math.min(Math.floor(st.written / size) + (st.written % size ? 1 : 0), groups.length)} / ${groups.length}`, `每批 ${size} 章`)}
+        ${statCard('待写章节', `${Math.max(0, (st.plan_total || 0) - st.written)}`, '按顺序逐章生成')}
       </div>
     </div>
 
@@ -1365,7 +1423,7 @@ function renderWrite() {
     ${S.generated.length ? `<div class="card">
       <div class="card-head"><h2>整书操作</h2></div>
       <div class="btn-row">
-        <button class="btn sm" data-act="check-all">朱雀全书检测</button>
+        ${S.config?.zhuque?.mode === 'manual' || !S.config?.zhuque?.enabled ? '' : '<button class="btn sm" data-act="check-all">朱雀全书检测</button>'}
         <button class="btn sm" data-act="polish-all">全书优化</button>
         <button class="btn sm" data-act="go" data-view="polish">导出成稿</button>
       </div>
@@ -1408,7 +1466,7 @@ function renderPolish() {
     <div class="card">
       <div class="card-head"><h2>章节列表</h2>
         <div class="btn-row">
-          <button class="btn sm ghost" data-act="check-all">朱雀全书检测</button>
+          ${S.config?.zhuque?.mode === 'manual' || !S.config?.zhuque?.enabled ? '' : '<button class="btn sm ghost" data-act="check-all">朱雀全书检测</button>'}
         </div>
       </div>
       ${rows.length ? `<div style="max-height:520px;overflow:auto"><table class="tbl">
@@ -1440,7 +1498,7 @@ function renderTasks() {
       <div>
         <div class="page-eyebrow">NOVEL FORGE / 07 QUEUE</div>
         <h1>任务中心</h1>
-        <p class="page-desc">所有批次按顺序执行，同一时间只跑一个任务，避免触发模型限流。暂停后当前章写完即停，随时可继续。</p>
+        <p class="page-desc">正文任务按章节顺序执行，同一时间只跑一个任务，避免触发模型限流。暂停后当前章写完即停，随时可继续。</p>
       </div>
       <div class="btn-row"><button class="btn ghost" onclick="location.reload()">刷新</button></div>
     </div>
@@ -1475,7 +1533,7 @@ function renderSettings() {
     ['analyze', '拆书 / 六维分析'],
     ['outline', '原创大纲 / 创作宪法'],
     ['write', '正文写作'],
-    ['check', '承接卡 / 偏离检测'],
+    ['check', '承接卡'],
     ['polish', '去 AIGC / 全书优化'],
   ];
   const modelOptions = [];
@@ -1515,7 +1573,7 @@ function renderSettings() {
               </select>
             </label>`).join('')}
         </div>
-        <p class="tiny muted" style="margin:0">承接卡与偏离检测留空时，会自动使用「正文写作」的模型；去 AIGC 留空时同样回退到写作模型。</p>
+        <p class="tiny muted" style="margin:0">承接卡留空时，会自动使用「正文写作」的模型；去 AIGC 留空时同样回退到写作模型。</p>
       </div>
     </div>
 
@@ -1537,7 +1595,9 @@ function renderSettings() {
     <div class="settings-block">
       <div class="settings-title">ZHUQUE · 朱雀检测</div>
       <div class="card">
-        <label class="check"><input type="checkbox" data-path="zhuque.enabled" ${zone.enabled ? 'checked' : ''}>启用朱雀检测（每章生成后自动检测，超标自动降重写）</label>
+        <p class="tiny muted" style="margin-top:0">最近一次朱雀接口余额：${S.zhuqueBalance?.balance ?? '未返回'}${S.zhuqueBalance?.checked_at ? `（${esc(S.zhuqueBalance.checked_at)}）` : ''}</p>
+        <label class="check"><input type="checkbox" data-path="zhuque.enabled" ${zone.enabled ? 'checked' : ''}>生成每章后自动调用一次朱雀 API；人工率高于 50% 标绿，疑似 AI 不超过 60% 可继续，超过 60% 限制下一章</label>
+        <label class="check"><input type="checkbox" data-path="zhuque.repair_enabled" ${zone.repair_enabled !== false ? 'checked' : ''}>检测后自动压缩高风险段（只改朱雀标为 AI 的段落，不整章重写）</label>
         <label class="field" style="margin-top:12px"><span>接入方式</span>
           <select data-path="zhuque.adapter">
             <option value="makers" ${zone.adapter === 'makers' ? 'selected' : ''}>腾讯云官方 · Makers 朱雀（只需 API Key）</option>
@@ -1548,8 +1608,8 @@ function renderSettings() {
         <div class="grid c2" style="margin-top:12px">
           <label class="field"><span>模式</span>
             <select data-path="zhuque.mode">
-              <option value="api" ${zone.mode === 'api' ? 'selected' : ''}>API 自动检测</option>
-              <option value="manual" ${zone.mode === 'manual' ? 'selected' : ''}>手动粘贴检测分</option>
+              <option value="api" ${zone.mode === 'api' ? 'selected' : ''}>API 模式（生成后自动检测一次）</option>
+              <option value="manual" ${zone.mode === 'manual' ? 'selected' : ''}>网页手动检测并记录分数</option>
             </select>
           </label>
           <label class="field" ${['tencent', 'makers'].includes(zone.adapter) ? 'hidden' : ''}><span>请求方法</span>
@@ -1584,11 +1644,16 @@ function renderSettings() {
         </div>
         </div>
         <div class="grid c3">
-          <label class="field"><span>合格线（≤ 该分通过）</span><input type="number" data-path="zhuque.pass_threshold" value="${zone.pass_threshold ?? 20}"></label>
-          <label class="field"><span>最多重写轮数</span><input type="number" data-path="zhuque.max_rounds" value="${zone.max_rounds ?? 2}"></label>
+          <label class="field"><span>继续写作上限</span><input type="number" value="60" readonly></label>
+          <label class="field"><span>自动压缩轮数</span><input type="number" data-path="zhuque.repair_rounds" value="${zone.repair_rounds ?? zone.max_rounds ?? 2}"></label>
           <label class="field"><span>超时（秒）</span><input type="number" data-path="zhuque.timeout" value="${zone.timeout ?? 60}"></label>
         </div>
-        <div class="btn-row"><button class="btn" data-act="zhuque-test">测试检测（一次调用）</button><span class="tiny muted">仅发送内置测试文本，按服务商规则计费；测试后记得保存设置。</span></div>
+        <div class="grid c3">
+          <label class="field"><span>自动压缩目标分（人工率高于 50% 即标绿）</span><input type="number" data-path="zhuque.repair_target" value="${zone.repair_target ?? 50}"></label>
+          <label class="field"><span>积分余额字段路径（可选）</span><input type="text" data-path="zhuque.balance_path" value="${esc(zone.balance_path || '')}" placeholder="如 data.balance"></label>
+          <label class="field"><span>余额低于此值时转网页</span><input type="number" step="0.01" data-path="zhuque.balance_minimum" value="${zone.balance_minimum ?? 1}"></label>
+        </div>
+        <div class="btn-row">${zone.enabled && zone.mode === 'api' ? '<button class="btn" data-act="zhuque-test">测试 API（一次调用）</button><span class="tiny muted">会消耗 API 额度；正式生成检测一次，必要时只压缩高风险段再复检。</span>' : '<span class="tiny muted">网页手动模式不调用 API；章节窗口始终可以复制正文并记录网页分数。</span>'}</div>
         <p id="zhuqueTestResult" class="tiny muted" role="status"></p>
       </div>
     </div>
@@ -1597,11 +1662,10 @@ function renderSettings() {
       <div class="settings-title">WRITING · 写作参数</div>
       <div class="card">
         <div class="grid c3">
-          <label class="field"><span>每批章节数</span><input type="number" data-path="writing.batch_size" value="${wr.batch_size ?? 5}"></label>
           <label class="field"><span>每章目标字数</span><input type="number" data-path="writing.words_per_chapter" value="${wr.words_per_chapter ?? 2600}"></label>
           <label class="field"><span>带入上一章结尾字数</span><input type="number" data-path="writing.context_tail_chars" value="${wr.context_tail_chars ?? 1800}"></label>
         </div>
-        <p class="tiny muted" style="margin:0">默认 5 章一批；修改后新建的批次按新值执行，已生成的批次不受影响。</p>
+        <p class="tiny muted" style="margin:0">每次写作任务只生成一章，保存后结束；检查完成后，再手动开始下一章。</p>
       </div>
     </div>
 
@@ -1610,7 +1674,7 @@ function renderSettings() {
       <div class="card">
         <div class="list-row"><span style="flex:1">数据库</span><span class="mono tiny muted">data/novel.db</span></div>
         <div class="list-row"><span style="flex:1">配置文件</span><span class="mono tiny muted">config.json</span></div>
-        <p class="tiny muted" style="margin:10px 0 0">项目数据保存在本机；调用模型和自动检测时，会发送所需文本到你配置的服务。停掉服务不会丢进度。</p>
+        <p class="tiny muted" style="margin:10px 0 0">项目数据保存在本机；调用模型时会发送所需文本到你配置的服务。朱雀默认网页手动检测，正文生成后不会自动上传检测。</p>
       </div>
     </div>
   `;
@@ -1658,8 +1722,9 @@ async function openReader(gid) {
     const score = g.zhuque_score;
     const stLabel = (STATUS[g.status] || [g.status])[0];
     const detection = g.detection;
+    const detectionRatios = zhuqueRatiosHtml(detection);
     const detectionNote = detection ? (detection.matches_current
-      ? `已核对本次送检正文：${num(detection.text_chars)} 字；${esc(detection.checked_at || '')}。${detection.metric === 'ratio_confidence' ? '分数表示被判为 AI / 疑似 AI 的内容占比，不代表作者身份概率。' : ''}`
+      ? `已核对本次送检正文：${num(detection.text_chars)} 字；${esc(detection.checked_at || '')}。${detection.makers_usage_tokens != null ? `本次扣减 ${detection.makers_usage_tokens} token。` : ''}${detection.balance != null ? `本次接口余额：${detection.balance}。` : g.zhuque_balance?.balance != null ? `最近一次接口余额：${g.zhuque_balance.balance}（${esc(g.zhuque_balance.checked_at || '')}），本次接口未返回余额。` : '接口尚未返回积分余额。'}${detection.manual_fallback ? '积分不足，请使用网页免费额度检测并记录分数。' : ''}${detection.manual_mode_next ? '余额已触发后续网页手动检测模式。' : ''}${detection.metric === 'ratio_confidence' ? '分数表示被判为 AI / 疑似 AI 的内容占比，不代表作者身份概率。' : ''}`
       : '正文已修改，上次检测对应旧版本，请重新检测。') : '历史检测未保留送检记录；重新检测后可核对正文版本。';
     showModal(`
       <div class="modal-head">
@@ -1668,7 +1733,7 @@ async function openReader(gid) {
           <h2 id="readerHeading">${esc(g.title)}</h2>
           <div class="tiny muted" style="margin-top:4px">
             ${num((g.content || '').replace(/\\s/g, '').length)} 字
-            ${score != null ? ` · AIGC ${score}` : ' · 未检测'}
+            ${score != null ? ` · <span class="chip ${zhuqueScoreClass(score)}">朱雀 ${score} 分</span>` : ' · 朱雀待检测'}
             ${g.polished ? ' · 有优化稿' : ''}
           </div>
         </div>
@@ -1688,16 +1753,23 @@ async function openReader(gid) {
       </div>
       <textarea class="editor" id="readerContent" style="min-height:420px">${esc(g.content)}</textarea>
 
+      <div class="card" style="margin-top:14px;padding:14px">
+        <button class="btn primary" data-act="naturalize-chapter" data-idx="${g.idx}">一键自然点化</button>
+        <p class="tiny muted" style="margin-bottom:0">先读取上一章正文、前五章剧情、大纲和本章计划；打散过于平均的段落与对白节奏，保留事件和衔接。原稿会备份；朱雀分数仍高时会按设置有限复检，只保留检测更低的候选稿。</p>
+      </div>
+
       <div class="grid c2" style="margin-top:14px">
         <div class="card" style="padding:14px">
           <div class="tiny muted" style="margin-bottom:6px">朱雀检测</div>
           <div class="inline">
             <input type="number" id="manualScore" placeholder="粘贴/输入检测分" value="${score ?? ''}">
             <button class="btn sm" data-act="record-score" data-id="${g.id}" style="flex:0 0 auto">记录分数</button>
-            <button class="btn sm ghost" data-act="recheck-chapter" data-idx="${g.idx}" style="flex:0 0 auto">重新检测</button>
+            <button class="btn sm ghost" data-act="copy-chapter" style="flex:0 0 auto">复制正文去网页检测</button>
+            ${zone.mode === 'manual' ? '' : `<button class="btn sm ghost" data-act="recheck-chapter" data-idx="${g.idx}" style="flex:0 0 auto">再次提交 API 检测</button>`}
           </div>
-          <div class="tiny muted" style="margin-top:6px">合格线 ≤ ${zone.pass_threshold ?? 20}${zone.mode === 'manual' ? '（当前为手动模式）' : ''}</div>
+          <div class="tiny muted" style="margin-top:6px">分数不高于 60 可继续；高于 60 暂停下一章${zone.mode === 'manual' ? '（当前为手动模式）' : ''}</div>
           <div class="tiny muted" style="margin-top:6px">${detectionNote}</div>
+          ${detectionRatios ? `<div style="margin-top:8px">${detectionRatios}</div>` : ''}
         </div>
         <div class="card" style="padding:14px">
           <div class="tiny muted" style="margin-bottom:6px">按指令重写这一章</div>

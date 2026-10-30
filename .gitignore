@@ -3,9 +3,11 @@ __pycache__/
 *.py[cod]
 .DS_Store
 config.json
+config.local.json
 data/*
 !data/.gitkeep
 artifacts/
+.local-snapshots/
 启动日志.txt
 *.log
 *.sqlite3

@@ -77,7 +77,16 @@ async def index():
 async def get_config():
     cfg = config.load()
     spent = db.q1("SELECT COALESCE(SUM(cost),0) AS c FROM usage_log")["c"]
-    return {"config": cfg, "spent": round(spent or 0, 4)}
+    balance_row = db.q1("SELECT content FROM assets WHERE key='zhuque_balance_latest' "
+                        "ORDER BY updated_at DESC LIMIT 1")
+    try:
+        balance_info = json.loads(balance_row["content"]) if balance_row else None
+    except (ValueError, TypeError):
+        balance_info = None
+    return {"config": cfg, "spent": round(spent or 0, 4),
+            "zhuque_balance": {"balance": balance_info.get("balance"),
+                               "checked_at": balance_info.get("checked_at")}
+                              if balance_info else None}
 
 
 @app.put("/api/config")
@@ -411,11 +420,14 @@ async def start_write(pid: int, payload: dict = Body(default={})):
     pipeline.finish_analysis(pid)
     mode = payload.get("mode", "next")
     batch = payload.get("batch")
-    title = {"next": "写作：继续下一批（5章）", "all": "写作：自动写完"}.get(mode, "写作")
-    if batch is not None:
-        title = f"写作：重新生成第 {int(batch) + 1} 批"
+    idx = payload.get("idx")
+    title = {"next": "写作：生成下一章", "all": "写作：生成下一章"}.get(mode, "写作：单章生成")
+    if idx is not None:
+        title = f"写作：第 {int(idx)} 章"
+    elif batch is not None:
+        title = f"写作：重生成第 {int(batch) + 1} 批首章"
     tid = db.create_task(pid, "write", title,
-                         {"mode": mode, "batch": batch, "force": bool(payload.get("force"))})
+                         {"mode": mode, "batch": batch, "idx": idx, "force": bool(payload.get("force"))})
     return {"task_id": tid}
 
 
@@ -431,6 +443,17 @@ async def generated_list(pid: int, full: int = 0):
             "has_polished": bool(r["polished"]),
         }
         item["excerpt"] = (r["content"] or "")[:120]
+        try:
+            import hashlib
+            detection = json.loads(db.get_asset(pid, f"zhuque_{r['idx']}_latest") or "null")
+            if detection:
+                current_hashes = {hashlib.sha256((r.get("content") or "").encode("utf-8")).hexdigest()}
+                if (r.get("polished") or "").strip():
+                    current_hashes.add(hashlib.sha256(r["polished"].encode("utf-8")).hexdigest())
+                detection["matches_current"] = detection.get("text_sha256") in current_hashes
+                item["detection"] = detection
+        except (ValueError, TypeError):
+            pass
         if full:
             item["content"] = r["content"]
             item["polished"] = r["polished"]
@@ -448,10 +471,17 @@ async def generated_one(gid: int):
             row[name] = json.loads(db.get_asset(row["project_id"], key) or "null")
         except (ValueError, TypeError):
             row[name] = None
+    try:
+        row["zhuque_balance"] = json.loads(db.get_asset(row["project_id"], "zhuque_balance_latest") or "null")
+    except (ValueError, TypeError):
+        row["zhuque_balance"] = None
     if row.get("detection"):
         import hashlib
-        row["detection"]["matches_current"] = row["detection"].get("text_sha256") == hashlib.sha256(
-            pipeline._chapter_text(row).encode("utf-8")).hexdigest()
+        checked_hash = row["detection"].get("text_sha256")
+        current_hashes = {hashlib.sha256((row.get("content") or "").encode("utf-8")).hexdigest()}
+        if (row.get("polished") or "").strip():
+            current_hashes.add(hashlib.sha256(row["polished"].encode("utf-8")).hexdigest())
+        row["detection"]["matches_current"] = checked_hash in current_hashes
     return row
 
 
@@ -493,8 +523,10 @@ async def check_chapters(pid: int, payload: dict = Body(default={})):
 async def rewrite(pid: int, payload: dict = Body(...)):
     config.resolve_stage("polish")
     idx = int(payload.get("idx") or 0)
-    tid = db.create_task(pid, "rewrite", f"重写第 {idx} 章",
-                         {"idx": idx, "instruction": payload.get("instruction") or ""})
+    naturalize = payload.get("style") == "natural"
+    tid = db.create_task(pid, "rewrite", f"{'自然点化' if naturalize else '重写'}第 {idx} 章",
+                         {"idx": idx, "instruction": payload.get("instruction") or "",
+                          "style": "natural" if naturalize else "rewrite"})
     return {"task_id": tid}
 
 
@@ -532,11 +564,39 @@ async def record_score(gid: int, payload: dict = Body(...)):
         score = float(payload.get("score"))
     except (TypeError, ValueError):
         raise ValueError("检测分必须是数字")
-    threshold = float(config.load()["zhuque"].get("pass_threshold") or 20)
-    status = "checked" if score <= threshold else "high_aigc"
+    if not math.isfinite(score) or not 0 <= score <= 100:
+        raise ValueError("检测分必须在 0–100 之间")
+    checked_text = payload.get("text")
+    if checked_text is not None and checked_text not in (row.get("content"), row.get("polished")):
+        raise ValueError("送检正文与当前保存版本不一致，请先保存章节，再重新检测并记录分数")
+    threshold = 60
+    status = pipeline._zhuque_status(score)
     db.execute("UPDATE generated SET zhuque_score=?, status=?, updated_at=? WHERE id=?",
                (score, status, db.now(), gid))
-    return {"ok": True, "score": score, "pass": score <= threshold}
+    import hashlib
+    checked_text = checked_text if checked_text is not None else pipeline._chapter_text(row)
+    prior = None
+    try:
+        prior = json.loads(db.get_asset(row["project_id"], f"zhuque_{row['idx']}_latest") or "null")
+    except (ValueError, TypeError):
+        pass
+    manual_report = {**(prior or {}), "chapter": row["idx"], "checked_at": db.now(),
+                     "text_sha256": hashlib.sha256(checked_text.encode("utf-8")).hexdigest(),
+                     "text_chars": len(checked_text), "score": score, "ok": True,
+                     "human_rate": round(max(0.0, 100 - score), 1),
+                     "manual": True, "source": "web_manual", "manual_fallback": False,
+                     "error": ""}
+    db.upsert_asset(row["project_id"], f"zhuque_{row['idx']}_latest",
+                    json.dumps(manual_report, ensure_ascii=False))
+    human = max(0.0, 100 - score)
+    if score < 50:
+        message = f"朱雀已通过，人工率 {human:.1f}%，可生成下一章"
+    elif score <= threshold:
+        message = f"朱雀疑似人工，人工率 {human:.1f}%，未超过 60%，可生成下一章"
+    else:
+        message = f"人工率 {human:.1f}%，疑似 AI 超过 60%，暂不能生成下一章"
+    return {"ok": True, "score": score, "human_rate": round(human, 1),
+            "pass": score <= threshold, "message": message}
 
 
 @app.get("/api/projects/{pid}/export")
@@ -635,7 +695,7 @@ async def continue_task(pid: int):
         if not plan or any(r["idx"] not in written for r in plan):
             config.resolve_stage("write")
             pipeline.finish_analysis(pid)
-            tid = db.create_task(pid, "write", "写作：继续下一批（5章）", {"mode": "next"})
+            tid = db.create_task(pid, "write", "写作：生成下一章", {"mode": "next"})
             return {"task_id": tid, "mode": "write"}
         return {"task_id": None, "mode": "none", "message": "大纲中现有章节已写完，可去大纲页补充后续计划或导出。"}
     if row:

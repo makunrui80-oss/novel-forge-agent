@@ -213,6 +213,7 @@ label.field > span { display: block; font-size: 11px; color: var(--muted); margi
 .chip.warn { color: var(--warn); border-color: rgba(240, 182, 74, 0.32); background: rgba(240, 182, 74, 0.08); }
 .chip.bad { color: var(--bad); border-color: rgba(255, 111, 135, 0.32); background: rgba(255, 111, 135, 0.08); }
 .chip.accent { color: #b9b0ff; border-color: rgba(127, 109, 255, 0.35); background: rgba(127, 109, 255, 0.1); }
+.zhuque-ratios { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 
 .stat {
   background: rgba(255, 255, 255, 0.025);
@@ -318,11 +319,14 @@ label.field > span { display: block; font-size: 11px; color: var(--muted); margi
 .chapter-card {
   border: 1px solid var(--line); border-radius: 11px; padding: 13px 15px;
   background: rgba(255, 255, 255, 0.02); cursor: pointer; transition: 0.16s;
+  min-width: 0; overflow: hidden;
 }
 .chapter-card:hover { border-color: rgba(127, 109, 255, 0.4); background: rgba(127, 109, 255, 0.05); transform: translateY(-1px); }
 .chapter-card .idx { font-family: var(--mono); font-size: 10px; color: var(--muted-2); letter-spacing: 0.1em; }
 .chapter-card .name { font-size: 13.5px; font-weight: 560; margin: 3px 0 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chapter-card .meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted-2); }
+.chapter-card .meta { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted-2); min-width: 0; flex-wrap: wrap; }
+.chapter-card .zhuque-ratios { margin-top: 6px; gap: 6px; width: 100%; flex-direction: column; align-items: stretch; }
+.chapter-card .zhuque-ratios .chip { width: 100%; max-width: 100%; box-sizing: border-box; overflow: hidden; text-overflow: ellipsis; }
 .chapter-card .excerpt { font-size: 11.5px; color: var(--muted-2); margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 /* ---------------- table ---------------- */

@@ -18,6 +18,7 @@ import httpx
 from . import config
 
 MAKERS_ENDPOINT = "https://ai-gateway.edgeone.link/v1/providers/zhuque-text/classify"
+PASS_THRESHOLD = 60
 
 
 def _get_path(data: Any, path: str) -> Any:
@@ -89,12 +90,81 @@ def validate_settings(cfg: dict) -> str:
     return ""
 
 
-def _failed(error: str) -> dict:
-    return {"ok": False, "score": None, "error": error, "manual": False}
+def _failed(error: str, *, manual_fallback: bool = False, balance: Any = None,
+            makers_usage_tokens: Any = None) -> dict:
+    return {"ok": False, "score": None, "error": error, "manual": False,
+            "manual_fallback": manual_fallback, "balance": balance,
+            "makers_usage_tokens": makers_usage_tokens}
+
+
+def _extract_balance(data: Any, cfg: dict) -> Any:
+    """从供应商返回中提取积分余额；没有余额字段时返回 None。"""
+    paths = [cfg.get("balance_path")]
+    paths.extend(("balance", "remaining_balance", "available_balance", "credit_balance",
+                  "remaining_credits", "available_credits", "credits", "points",
+                  "remaining_points", "points_remaining", "quota", "remaining_quota"))
+    for path in paths:
+        if not path:
+            continue
+        value = _get_path(data, str(path))
+        if isinstance(value, dict):
+            for key in ("remaining", "available", "balance", "credits", "points", "amount"):
+                value = value.get(key)
+                if value is not None:
+                    break
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _extract_makers_usage(data: Any) -> int | None:
+    """返回本次实际扣减的 Makers 免费额度 token 数。"""
+    value = _get_path(data, "makers_models_usage.total_tokens")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _extract_labels_ratio(data: Any) -> dict[str, float]:
+    """保留朱雀返回的三类内容比例，统一为 0–1 小数。"""
+    raw = data.get("labels_ratio") if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key in ("0", "1", "2"):
+        value = raw.get(key, raw.get(int(key)))
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            # 官方响应是比例；兼容少数网关把比例乘成百分数的情况。
+            if value > 1:
+                value /= 100
+            result[key] = round(max(0.0, min(1.0, value)), 6)
+    return result
+
+
+def _insufficient_balance(data: Any) -> bool:
+    try:
+        text = json.dumps(data, ensure_ascii=False).lower()
+    except (TypeError, ValueError):
+        text = str(data).lower()
+    return any(term in text for term in (
+        "积分不足", "余额不足", "额度不足", "欠费", "insufficient balance",
+        "insufficient quota", "quota exceeded", "out of credits", "no credits",
+    ))
 
 
 def _http_error(status: int) -> str:
-    tips = {401: "API Key 错误或失效，请核对网关密钥。", 403: "网关未获准调用朱雀，请确认已开通 zhuque-text 权限。",
+    tips = {401: "API Key 错误或失效，请核对网关密钥。", 402: "朱雀积分余额不足，请复制正文到朱雀网页使用免费额度检测。",
+            403: "网关未获准调用朱雀，请确认已开通 zhuque-text 权限。",
             404: "地址或任务不存在，请核对网关域名及接口路径。", 429: "检测接口限流，请稍后重试。"}
     return f"检测接口 HTTP {status}：" + tips.get(status, "上游服务异常，请稍后重试。" if status >= 500 else "请求不符合接口要求，请检查配置。")
 
@@ -110,15 +180,24 @@ async def _detect_tencent(text: str, cfg: dict) -> dict:
         headers["Work-Mode"] = "async"
     timeout = float(cfg.get("timeout") or 60)
     deadline = time.monotonic() + timeout
+    balance = None
     local = parsed.hostname in ("127.0.0.1", "localhost", "::1")
     async with httpx.AsyncClient(timeout=timeout, trust_env=not local) as client:
         # 不自动重提任务：官方说明重试提交可能重复计费。
         response = await client.post(base + '/classify', headers=headers, json={"text": text, "is_merge": True})
         if response.status_code >= 400:
-            return _failed(_http_error(response.status_code))
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = response.text
+            return _failed(_http_error(response.status_code),
+                           manual_fallback=response.status_code == 402 or _insufficient_balance(error_body),
+                           balance=_extract_balance(error_body, cfg))
         data = response.json()
         if not isinstance(data, dict):
             return _failed("朱雀返回格式错误：应为 JSON 对象。")
+        balance = _extract_balance(data, cfg)
+        usage_tokens = _extract_makers_usage(data) if makers else None
         if asynchronous:
             task_id = data.get("TaskId")
             if not isinstance(task_id, str) or not task_id:
@@ -136,7 +215,14 @@ async def _detect_tencent(text: str, cfg: dict) -> dict:
                     await asyncio.sleep(min(2 ** retries, max(0, deadline - time.monotonic())))
                     continue
                 if response.status_code >= 400:
-                    return _failed(_http_error(response.status_code))
+                    try:
+                        error_body = response.json()
+                    except ValueError:
+                        error_body = response.text
+                    return _failed(_http_error(response.status_code),
+                                   manual_fallback=response.status_code == 402 or _insufficient_balance(error_body),
+                                   balance=_extract_balance(error_body, cfg) if _extract_balance(error_body, cfg) is not None else balance,
+                                   makers_usage_tokens=usage_tokens)
                 data = response.json()
                 if not isinstance(data, dict):
                     return _failed("朱雀查询返回格式错误。")
@@ -144,14 +230,18 @@ async def _detect_tencent(text: str, cfg: dict) -> dict:
                 if state == "SUCCEEDED":
                     output = data.get("Output")
                     data = json.loads(output) if isinstance(output, str) else output
+                    if isinstance(data, dict):
+                        balance = _extract_balance(data, cfg) if _extract_balance(data, cfg) is not None else balance
                     break
                 if state == "FAILED":
-                    return _failed("朱雀检测任务失败，请在 EdgeOne 控制台查看原因及网关权限。")
+                    return _failed("朱雀检测任务失败，请检查积分余额、EdgeOne 控制台和网关权限。",
+                                   manual_fallback=_insufficient_balance(data), balance=balance)
                 if state not in ("QUEUED", "PROCESSING"):
                     return _failed("朱雀返回未识别的任务状态，未记录分值。")
                 await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
         if not isinstance(data, dict) or data.get("status") != "success":
-            return _failed("朱雀推理未成功，未记录分值，请检查网关服务。")
+            return _failed("朱雀推理未成功，未记录分值，请检查网关服务。",
+                           manual_fallback=_insufficient_balance(data), balance=_extract_balance(data, cfg))
         # 官方定义：整体疑似 AI 内容占比，不能误用某个分段或置信度当成占比。
         try:
             ratio = data["ratio_confidence"]
@@ -161,16 +251,22 @@ async def _detect_tencent(text: str, cfg: dict) -> dict:
             if not math.isfinite(ratio) or not 0 <= ratio <= 1:
                 raise ValueError()
         except (KeyError, ValueError, TypeError):
-            return _failed("朱雀结果缺少合法的 ratio_confidence（0–1），未记录分值。")
+            return _failed("朱雀结果缺少合法的 ratio_confidence（0–1），未记录分值。",
+                           balance=_extract_balance(data, cfg))
         score = round(ratio * 100, 1)
         # 只保留判定元信息，不返回请求头、密钥或分段原文。
+        labels_ratio = _extract_labels_ratio(data)
         diagnostics = {"status": data.get("status"), "ratio_confidence": ratio,
                        "softmax_confidence": data.get("softmax_confidence"),
-                       "labels_ratio": data.get("labels_ratio", {}),
+                       "labels_ratio": labels_ratio,
                        "segments": [{k: segment.get(k) for k in ("label", "conf", "position")}
                                     for segment in (data.get("segment_labels") or []) if isinstance(segment, dict)]}
-        return {"ok": True, "score": score, "manual": False, "pass": score <= float(cfg.get("pass_threshold", 20)),
-                "metric": "ratio_confidence", "labels_ratio": data.get("labels_ratio", {}),
+        balance = _extract_balance(data, cfg) if balance is None else balance
+        usage_tokens = _extract_makers_usage(data) if makers else usage_tokens
+        return {"ok": True, "score": score, "manual": False, "balance": balance,
+                "makers_usage_tokens": usage_tokens,
+                "pass": score <= float(cfg.get("pass_threshold", PASS_THRESHOLD)),
+                "metric": "ratio_confidence", "labels_ratio": labels_ratio,
                 "diagnostics": diagnostics}
 
 
@@ -221,7 +317,13 @@ async def detect(text: str, settings: dict | None = None) -> dict:
             else:
                 resp = await client.request(method, endpoint, headers=headers, json=body)
         if resp.status_code >= 400:
-            return _failed(_http_error(resp.status_code))
+            try:
+                error_body = resp.json()
+            except ValueError:
+                error_body = resp.text
+            return _failed(_http_error(resp.status_code),
+                           manual_fallback=resp.status_code == 402 or _insufficient_balance(error_body),
+                           balance=_extract_balance(error_body, cfg))
         raw_text = resp.text
         try:
             data = resp.json()
@@ -238,9 +340,12 @@ async def detect(text: str, settings: dict | None = None) -> dict:
         if score is None:
             return {"ok": False, "score": None,
                     "error": f"没能从返回里解析出分值，请检查 score_path。返回：{raw_text[:300]}",
-                    "raw": raw_text, "manual": False}
+                    "raw": raw_text, "manual": False,
+                    "manual_fallback": _insufficient_balance(data if data is not None else raw_text),
+                    "balance": _extract_balance(data, cfg) if data is not None else None}
+        balance = _extract_balance(data, cfg) if data is not None else None
         return {"ok": True, "score": score, "raw": raw_text[:2000], "manual": False,
-                "pass": score <= float(cfg.get("pass_threshold", 20))}
+                "balance": balance, "pass": score <= float(cfg.get("pass_threshold", PASS_THRESHOLD))}
     except httpx.TimeoutException:
         return _failed("检测请求超时，请检查服务或增加超时设置。")
     except httpx.RequestError:
